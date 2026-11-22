@@ -57,11 +57,37 @@ using namespace cute;
 template<bool USE_MMA_M8=true, typename elem_type=cutlass::half_t>
 struct Flash_kernel_traits {
     static constexpr bool QKV_FP8 = std::is_same_v<elem_type, cutlass::float_e4m3_t>;
+    // The PPU1.5 FP8 MMA atom is only usable when BOTH hold:
+    //   * a device pass with __HGGC_ARCH__ >= 100, and
+    //   * ACOMPUTE_VERSION == 10500 -- the FP8 atom lives in the `== 10500`
+    //     branch of the MMA_Atom_Arch selection below, and the wheel is built
+    //     with -DACOMPUTE_VERSION=10000.  Only the ppu0015 pass reaches 10500
+    //     (sparse_decode_wg_traits.h raises it for the FP8 atoms).
+    // Everything that has to agree with the MMA operand type must key off this
+    // rather than QKV_FP8, otherwise the host and ppu001 passes build e4m3 copy
+    // atoms against bf16 fragments and the copy-layout static_asserts fire.
+#if defined(__HGGC_ARCH__) && __HGGC_ARCH__ >= 100 && ACOMPUTE_VERSION >= 10500
+    static constexpr bool HasFp8Mma = QKV_FP8;
+#else
+    static constexpr bool HasFp8Mma = false;
+#endif
+    // All FP8-specific layout/atom choices below must follow the *device*
+    // configuration.  On the host pass there is no FP8 atom, so treating the
+    // traits as FP8 would build e4m3 copy atoms against half/bfloat16
+    // fragments and trip the copy-layout static_asserts.  Host-side callers
+    // that need the true element type use InputT (see the note further down),
+    // so folding this to HasFp8Mma is consistent and keeps the host pass
+    // typechecking with the same shapes the device pass will use.
 #if defined(__HGGC_ARCH__) &&  __HGGC_ARCH__ >= 100
     using Element = elem_type;
     static constexpr bool Has_cp_async = true;
 #else
-    using Element = std::conditional_t<QKV_FP8, elem_type, cutlass::half_t>;
+    // Host pass: no device code is generated here, the pass only has to
+    // typecheck the launch.  The fallback MMA atom below is BF16/half-typed, so
+    // Element must degrade to half_t as well -- keeping e4m3 here would make
+    // partition_fragment produce half fragments from an e4m3 smem tensor and
+    // fail the copy-layout static_asserts in the host pass.
+    using Element = cutlass::half_t;
     static constexpr bool Has_cp_async = false;
 #endif
 
@@ -81,7 +107,7 @@ struct Flash_kernel_traits {
 #elif defined(USE_PPU) && ACOMPUTE_VERSION == 10500
         MMA_Atom<PPU0015_16x16x16_F32F16F16F32_TN>,
         std::conditional_t<
-          QKV_FP8,
+          HasFp8Mma,
           MMA_Atom<PPU0015_16x16x32_F32E4M3E4M3F32_TN>,
           MMA_Atom<PPU0015_16x16x16_F32BF16BF16F32_TN>
         >
@@ -158,6 +184,7 @@ struct Flash_fwd_kernel_traits : public Base {
     static constexpr int kStages = kStages_;
     static constexpr bool kPagePow2 = page_pow2_;
     static constexpr bool QKV_FP8 = Base::QKV_FP8;
+    static constexpr bool HasFp8Mma = Base::HasFp8Mma;
 
     static constexpr bool USE_MMA_M8 = USE_MMA_M8_;
     static constexpr bool CrossCut = CrossCut_;
@@ -179,12 +206,12 @@ struct Flash_fwd_kernel_traits : public Base {
        gmem tensors must be built from kHeadDimRaw; smem/MMA extents use kHeadDim/kHeadDimPadding.
        The 576->640 pad columns are zero-filled by the AIU hardware (padz). */
     static constexpr int kHeadDimRaw = kHeadDim_;
-    static constexpr int kHeadDim = QKV_FP8 ? ((kHeadDimRaw + 127) / 128) * 128 : kHeadDimRaw;
+    static constexpr int kHeadDim = HasFp8Mma ? ((kHeadDimRaw + 127) / 128) * 128 : kHeadDimRaw;
     static constexpr int kHeadDimV = kHeadDimV_;
     static_assert(kHeadDim % 32 == 0);
     static_assert(kHeadDimV % 32 == 0);
-    static constexpr int kBlockKSmem = QKV_FP8 ? 128 : kHeadDim % 64 == 0 ? 64 : 32;
-    static constexpr int kBlockKSmemV = QKV_FP8 ? 128 : kHeadDimV % 64 == 0 ? 64 : 32;
+    static constexpr int kBlockKSmem = HasFp8Mma ? 128 : kHeadDim % 64 == 0 ? 64 : 32;
+    static constexpr int kBlockKSmemV = HasFp8Mma ? 128 : kHeadDimV % 64 == 0 ? 64 : 32;
     static constexpr int kBlockKSmemVStore = kHeadDimV % 64 == 0 ? 64 : 32;
     // static constexpr int kBlockKGmem = kHeadDim % 128 == 0 ? 128 : (kHeadDim % 64 == 0 ? 64 : 32);
     static constexpr int kSwizzle = kBlockKSmem == 32 ? 2 : 3;
@@ -204,7 +231,7 @@ struct Flash_fwd_kernel_traits : public Base {
         >;
     using SmemCopyOpK = PPU_TSM_LD_SWZL<elem_type, kBlockNPagedPerAiuLoad, kBlockKSmem, true, false, 
             kBlockN / kBlockNPagedPerAiuLoad * kHeadDim / kBlockKSmem>;
-    using SmemCopyOpVt = PPU_TSM_LD_SWZL<elem_type, kBlockNPagedPerAiuLoad, kBlockKSmemV, true, !QKV_FP8,
+    using SmemCopyOpVt = PPU_TSM_LD_SWZL<elem_type, kBlockNPagedPerAiuLoad, kBlockKSmemV, true, !HasFp8Mma,
             kBlockN/kBlockNPagedPerAiuLoad * kHeadDimPadding / kBlockKSmemV>;
 
 #else
@@ -220,7 +247,7 @@ struct Flash_fwd_kernel_traits : public Base {
                                       kBlockN / kBlockNPagedPerAiuLoad * kHeadDimPadding/kBlockKSmem, true, -1>,
         PPU_TSM_LD_SWZL<elem_type, kBlockNPagedPerAiuLoad, kBlockKSmem, true, false, kBlockN / kBlockNPagedPerAiuLoad * kHeadDim / kBlockKSmem>
     >;
-    static constexpr int kVTilesPerRow = (QKV_FP8 ? kHeadDim : kHeadDimPadding) / kBlockKSmemV;
+    static constexpr int kVTilesPerRow = (HasFp8Mma ? kHeadDim : kHeadDimPadding) / kBlockKSmemV;
     using SmemCopyOpVt = std::conditional_t<
         CvtGemm0SwzlLd,
         PPU0015_TSM_LD_SWZL_CVT<elem_type, kBlockNPagedPerAiuLoad, kBlockKSmemV, kBlockNPagedPerAiuLoad, kHeadDimPadding, true, true,
@@ -250,24 +277,24 @@ struct Flash_fwd_kernel_traits : public Base {
     using TiledMmaS = TiledMMA<
         typename Base::MMA_Atom_Arch,
         Layout<Shape<Int<AtomLayoutQ>, Int<kNWarps0/AtomLayoutQ>, _1>>,
-        Tile<Int<MMA_ATOM_M * AtomLayoutQ>, Int<16 * kNWarps0/AtomLayoutQ>, Int<QKV_FP8 ? 32 : 16>>>;
+        Tile<Int<MMA_ATOM_M * AtomLayoutQ>, Int<16 * kNWarps0/AtomLayoutQ>, Int<HasFp8Mma ? 32 : 16>>>;
 
     /// The second gemm in CrossCut; gemm in !CrossCut ///
     /// fp8 V-direct: pair-blocked N mode, each warp owns the adjacent tile pair
     /// {2np, 2np+1}; needs even per-warp n-tiles (static_asserted in gemm_pv_fp8_vdirect).
-    using TiledMmaNMode = std::conditional_t<QKV_FP8,
+    using TiledMmaNMode = std::conditional_t<HasFp8Mma,
         Layout<Shape<_16, Int<kNWarps/AtomLayoutP>, _2>, Stride<_1, _32, _16>>,
         Int<16 * kNWarps/AtomLayoutP>>;
     using TiledMma = TiledMMA<
         typename Base::MMA_Atom_Arch,
         Layout<Shape<Int<AtomLayoutP>, Int<kNWarps/AtomLayoutP>, _1>>,
-        Tile<Int<MMA_ATOM_M * AtomLayoutP>, TiledMmaNMode, Int<QKV_FP8 ? 32 : 16>>>;
+        Tile<Int<MMA_ATOM_M * AtomLayoutP>, TiledMmaNMode, Int<HasFp8Mma ? 32 : 16>>>;
 
     /// fp8 V-direct store-only twin of TiledMmaS: EpiPerm CLayout for the pi_k
     /// sP order (see gemm_pv_fp8_vdirect); aliases TiledMmaS on non-fp8/ppu0015 configs.
 #if defined(USE_PPU) && ACOMPUTE_VERSION >= 10500
     using TiledMmaSPStore = std::conditional_t<
-        QKV_FP8,
+        HasFp8Mma,
         TiledMMA<
             MMA_Atom<PPU0015_16x16x32_F32E4M3E4M3F32_TN_EpiPerm>,
             Layout<Shape<Int<AtomLayoutQ>, Int<kNWarps0/AtomLayoutQ>, _1>>,
@@ -337,15 +364,15 @@ struct Flash_fwd_kernel_traits : public Base {
 
     using SmemLayoutAtomO = decltype(
         composition(Swizzle<kSwizzleV, 3, 3>{},
-                    Layout<Shape<Int<8>, Int<QKV_FP8 ? kBlockKSmemVStore : kBlockKSmemV>>,
-                           Stride<Int<QKV_FP8 ? kBlockKSmemVStore : kBlockKSmemV>, _1>>{}));
+                    Layout<Shape<Int<8>, Int<HasFp8Mma ? kBlockKSmemVStore : kBlockKSmemV>>,
+                           Stride<Int<HasFp8Mma ? kBlockKSmemVStore : kBlockKSmemV>, _1>>{}));
 
     using SmemLayoutO = decltype(tile_to_shape(
         SmemLayoutAtomO{},
         Shape<Int<kBlockM>, Int<kHeadDimV>>{}));
 
     using ElementOutputType =  std::conditional_t<
-        QKV_FP8,
+        HasFp8Mma,
         cutlass::bfloat16_t,
         elem_type
         >;
@@ -359,7 +386,7 @@ struct Flash_fwd_kernel_traits : public Base {
 #if ACOMPUTE_VERSION == 10000
         composition(PPU_Swizzle<kSwizzleP, 3, 3>{},
 #else
-        composition(Swizzle<kSwizzleP, QKV_FP8 ? 4 : 3, 3>{},
+        composition(Swizzle<kSwizzleP, HasFp8Mma ? 4 : 3, 3>{},
 #endif
                     Layout<Shape<Int<kBlockM>, Int<kBlockN>>,
                            Stride<Int<kBlockN>, _1>>{}));
@@ -389,7 +416,7 @@ struct Flash_fwd_kernel_traits : public Base {
         USE_MMA_M8,
         Copy_Atom<DefaultCopy, elem_type>, // if m8, stack for tsm.ld.matrix
         std::conditional_t<
-            QKV_FP8,
+            HasFp8Mma,
             CopyAtomFP8,
             SmemCopyAtom
             >
@@ -397,7 +424,7 @@ struct Flash_fwd_kernel_traits : public Base {
 #if USE_AIU
     using SmemCopyAtomP_TLS = Copy_Atom<PPU_TSM_LD_SWZL<elem_type, kBlockM, kBlockN, false, false, 1>, elem_type>;
 #endif
-    using SmemCopyAtomS = Copy_Atom<std::conditional_t<QKV_FP8, AutoVectorizingCopyWithAssumedAlignment<16>, DefaultCopy>, elem_type>;
+    using SmemCopyAtomS = Copy_Atom<std::conditional_t<HasFp8Mma, AutoVectorizingCopyWithAssumedAlignment<16>, DefaultCopy>, elem_type>;
     // using SmemCopyAtomS = Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, Element>;
     /// end for CrossCut ///
 
@@ -417,7 +444,18 @@ struct Flash_fwd_kernel_traits : public Base {
     static constexpr int kSmemCrossCut = CrossCut ? kSmemPSize + kSmemSoftmax : 0;
 
     static constexpr int kSmemSize = std::max(kSmemSizeQK + kSmemCrossCut, OSmemSize);
-    static constexpr int kSmemSizeAccum = std::max(kSmemSizeQK + kSmemCrossCut, OSmemSizeAccum);
+    // The CrossCut store paths stage O through SmemLayoutO at accumulator (fp32)
+    // width and then append per-warp/ per-group scratch AFTER that staging area
+    // (see the kStageBytes-based offsets in fused_v41_splitkv.cuh).  Accounting
+    // for OSmemSizeAccum alone is therefore not sufficient -- it leaves the
+    // scratch with no room.  Under BF16 the QK term happened to be larger and
+    // masked this; under FP8 (smaller Q/KV staging) it is the binding term, so
+    // the scratch must be reserved explicitly.
+    static constexpr int kSmemStoreScratch =
+        (kNWarps + (kBlockM / 8)) * sizeof(ElementAccum)   // partials + inverses
+        + kBlockM * sizeof(bool);                          // row_valid flags
+    static constexpr int kSmemSizeAccum =
+        std::max(kSmemSizeQK + kSmemCrossCut, OSmemSizeAccum + kSmemStoreScratch);
     static_assert(kSmemSizeAccum <= 256 * 1024, "dynamic smem request exceeds the 256KB cap");
 
     static constexpr int kGmemElemsPerLoad = sizeof(cute::uint128_t) / sizeof(Element);

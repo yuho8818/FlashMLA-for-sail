@@ -240,12 +240,19 @@ __forceinline__ __device__ void compute_attn_fp8_sparse_splitkv(
                             make_stride(params.q_row_stride, _1{}));
 
     Tensor sQ = make_tensor(make_smem_ptr(reinterpret_cast<Element *>(smem_)), typename Kernel_traits::SmemLayoutQ{});
-    Tensor sK = make_tensor(sQ.data() + (Kernel_traits::Share_Q_K_smem ? 0 : size(sQ)), SmemLayoutKNoAiu{});
+    // FP8 compute reinterprets the same smem region with the E4M3 staging
+    // layout.  Both layouts cover the identical (kBlockN, kHeadDim) element
+    // count -- only the swizzle row width differs (128 vs 64) -- so this is a
+    // reinterpretation of the buffer the g2s loader already filled, not a
+    // second copy.  sVt then aliases the very same bytes as before.
+    using SmemLayoutKActive = std::conditional_t<Kernel_traits::HasFp8Mma,
+        typename KVCacheGmem::SmemLayoutKNopeFP8, SmemLayoutKNoAiu>;
+    Tensor sK = make_tensor(sQ.data() + (Kernel_traits::Share_Q_K_smem ? 0 : size(sQ)), SmemLayoutKActive{});
     Tensor sVt = make_tensor(sK.data(), SmemLayoutVtransposedNoAiu{});
     Tensor sVtNoSwizzle = make_tensor(sK.data(), typename Kernel_traits::SmemLayoutVtransposedNoSwizzle{});
 
     // double shared memory for k/v cache.
-    Tensor sK_double = make_tensor(sK.data() + size(sK), SmemLayoutKNoAiu{});
+    Tensor sK_double = make_tensor(sK.data() + size(sK), SmemLayoutKActive{});
     Tensor sP = make_tensor(sK_double.data() + size(sK_double), typename Kernel_traits::SmemLayoutP{});
 
     Tensor smem_row_scale = make_tensor(make_smem_ptr(reinterpret_cast<float *>((sP.data() + size(sP)).get())),
@@ -349,7 +356,15 @@ __forceinline__ __device__ void compute_attn_fp8_sparse_splitkv(
     auto smem_thr_copy_V = smem_tiled_copy_V.get_thread_slice(tidx);
     auto tOsVt = smem_thr_copy_V.partition_S(sVt);
 #else
-    auto smem_tiled_copy_K = make_tiled_copy_B(typename KVCacheGmem::SmemCopyAtomK{}, tiled_mma_s);
+    // FP8 compute reads K straight out of the E4M3 staging, so both the smem
+    // layout and the copy atom switch to the FP8 forms (128-wide swizzle row).
+    auto smem_tiled_copy_K = [&] {
+        if constexpr (Kernel_traits::HasFp8Mma) {
+            return make_tiled_copy_B(typename KVCacheGmem::SmemCopyAtomKFp8{}, tiled_mma_s);
+        } else {
+            return make_tiled_copy_B(typename KVCacheGmem::SmemCopyAtomK{}, tiled_mma_s);
+        }
+    }();
     auto smem_thr_copy_K = smem_tiled_copy_K.get_thread_slice(tid_thread_slice);
     auto tSsK = smem_thr_copy_K.partition_S(make_mix_tensor_like(sK));
 
@@ -484,7 +499,14 @@ __forceinline__ __device__ void compute_attn_fp8_sparse_splitkv(
                 fp4load_gmem.cvt_fp4_store(sK_cvt);
             }
         } else {
-            kvload_gmem.template cvt_fp8_store<!IsExtraFP4 || RegisterFP4>(sK_cvt, sK_cvt, tKrScale);
+            // FP8 compute keeps the staged E4M3 in place: both GEMMs consume FP8
+            // operands (QK^T directly, PV via the vdirect reader), so the usual
+            // in-place dequantize-to-BF16 step must not run.  Note the V4.1-FP8
+            // cache row holds K and V as the same 512 E4M3 values, so K and V
+            // cannot carry different precisions -- they are one buffer.
+            if constexpr (!Kernel_traits::HasFp8Mma) {
+                kvload_gmem.template cvt_fp8_store<!IsExtraFP4 || RegisterFP4>(sK_cvt, sK_cvt, tKrScale);
+            }
         }
         __syncthreads();
 
@@ -541,8 +563,17 @@ __forceinline__ __device__ void compute_attn_fp8_sparse_splitkv(
         }
 
         auto tOsVt_curr = make_tensor(tOsVt.data() + buf_idx * size(sK), layout(tOsVt));
+        if constexpr (Kernel_traits::HasFp8Mma) {
+            // FP8 PV: V is read straight out of the E4M3 staging as bf16 pairs
+            // (this device has no b8 transposing ldmatrix), and the resulting
+            // pi_n column interleave is undone outside the main loop.  See
+            // gemm_pv_fp8_vdirect / permute_output_fp8 in csrc/utils.h.
+            flash::gemm_pv_fp8_vdirect<Kernel_traits>(acc_o, tOrP, tOrVt, tOsP,
+                sK.data().get(), buf_idx, tiled_mma_o, smem_tiled_copy_P, smem_thr_copy_P);
+        } else {
         flash::gemm(acc_o, tOrP, tOrVt, tOsP, tOsVt_curr, tiled_mma_o, smem_tiled_copy_P, smem_tiled_copy_V,
                 smem_thr_copy_P, smem_thr_copy_V);
+        }
 
         if constexpr (!IS_LAST_BLOCK) {
             smem_valid_indices(nxt_buf_idx, col_in_indices) = valid;
@@ -988,8 +1019,13 @@ __forceinline__ __device__ void compute_attn_bf16_sparse_splitkv(
         }
 
         auto tOsVt_curr = make_tensor(tOsVt.data() + buf_idx * size(sK), layout(tOsVt));
+        if constexpr (Kernel_traits::HasFp8Mma) {
+            flash::gemm_pv_fp8_vdirect<Kernel_traits>(acc_o, tOrP, tOrVt, tOsP,
+                sK.data().get(), buf_idx, tiled_mma_o, smem_tiled_copy_P, smem_thr_copy_P);
+        } else {
         flash::gemm(acc_o, tOrP, tOrVt, tOsP, tOsVt_curr, tiled_mma_o, smem_tiled_copy_P, smem_tiled_copy_V,
             smem_thr_copy_P, smem_thr_copy_V);
+        }
     };
 
     if constexpr (kHeadDim == 512) {

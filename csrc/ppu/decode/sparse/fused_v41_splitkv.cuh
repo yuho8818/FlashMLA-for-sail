@@ -14,13 +14,36 @@ namespace splitkv {
 
 using namespace cute;
 
-template<int Heads, bool PagePow2>
+template<int Heads, bool PagePow2, typename Elem = cutlass::bfloat16_t>
 using Traits = Flash_fwd_kernel_traits<
     512, Heads == 8 ? 16 : 64, Heads == 8 ? 32 : 64, Heads == 8 ? 8 : 16,
     /*Is_Q_in_regs=*/true, /*Share_Q_K_smem=*/false,
-    cutlass::bfloat16_t, 512, /*CrossCut=*/true, /*USE_MMA_M8=*/false,
+    Elem, 512, /*CrossCut=*/true, /*USE_MMA_M8=*/false,
     /*AtomLayoutQ=*/Heads == 8 ? 1 : 4, /*AtomLayoutP=*/Heads == 8 ? 1 : 2,
     Heads == 8 ? 32 : 64, 2, /*kNWarps0=*/Heads == 8 ? 2 : 16, PagePow2>;
+
+// FP8-compute variant of the five-in-one (V523-S22, step A1).
+//
+// In A1 the QK^T GEMM runs on the PPU1.5 E4M3xE4M3->F32 atom
+// (PPU0015_16x16x32_F32E4M3E4M3F32_TN, K=32): Q is quantized to E4M3 after RoPE
+// and K is kept as E4M3 in smem instead of being dequantized to BF16.
+//
+// The PV GEMM deliberately remains BF16.  Running PV in FP8 additionally needs
+// the "V-direct" scheme (ldmatrix.trans.b16 load + byte_perm assembly + the pi_n
+// even/odd column fix via permute_output_fp8 and an EpiPerm epilogue atom),
+// because this part has no b8 transposed ldmatrix.  That is step A2 and is not
+// enabled here, so store_output still sees natural accumulator columns and its
+// !QKV_FP8 guard below is replaced by an explicit PV-precision flag.
+//
+// The BF16 alias above stays byte-identical so the baseline arm is untouched.
+template<int Heads, bool PagePow2>
+using TraitsFp8 = Traits<Heads, PagePow2, cutlass::float_e4m3_t>;
+
+// True when the PV GEMM consumes FP8 operands, which (via
+// gemm_pv_fp8_vdirect) leaves acc_o in the pi_n-interleaved column order and so
+// requires permute_output_fp8 plus an EpiPerm-aware epilogue.
+template<typename KT>
+static constexpr bool kPvFp8 = KT::HasFp8Mma;
 
 template<typename KT, bool ExtraFP4>
 constexpr size_t scratch_offset() {
@@ -37,19 +60,36 @@ __forceinline__ __device__ float2 apply_rope(float2 x, float c, float s) {
     return float2{fmaf(x.x, c, -x.y * s), fmaf(x.x, s, x.y * c)};
 }
 
-template<int Rows>
+// Q smem swizzle.  The TSM loader takes smem_base + coordinates and applies the
+// swizzle in hardware, so this function IS the layout contract -- it must match
+// the swizzle mode the SmemCopyOpQ instance was built with.
+//
+// The selector must be the SAME one that picks kBlockKSmem/the Q copy atom
+// (HasFp8Mma), not ACOMPUTE_VERSION: this TU is compiled at 10000 for the BF16
+// arm and at 10500 for the FP8 arm, so keying on ACOMPUTE_VERSION would flip
+// both the period AND the branch independently of the atom actually in use.
+//   BF16 (kBlockKSmem=64): 64-wide period, XOR swizzle
+//   FP8  (kBlockKSmem=128): 128-wide period, XOR swizzle on 128
+// Getting this wrong does not fail to compile; it silently permutes Q and shows
+// up as an accuracy collapse.
+template<typename KT>
 __forceinline__ __device__ int native_offset(int row, int dim) {
-    const int tile = dim / 64;
-    const int col = dim % 64;
-#if ACOMPUTE_VERSION == 10000
-    const int slice = col / 16;
-    const int rotation = (((slice & 1) << 1) + ((slice & 2) >> 1)) * 2;
-    const int vec = (((row % 4) * 2 + (col % 16) / 8) ^ ((row / 4) & 1));
-    return tile * Rows * 64 + slice * Rows * 16 + (row / 4) * 64
-        + ((vec + rotation) % 8) * 8 + col % 8;
-#else
-    return tile * Rows * 64 + row * 64 + (col ^ ((row & 7) << 3));
-#endif
+    if constexpr (KT::HasFp8Mma) {
+        constexpr int kPeriod = KT::kBlockKSmem;   // 128 for FP8
+        const int tile = dim / kPeriod;
+        const int col = dim % kPeriod;
+        return tile * KT::kBlockM * kPeriod + row * kPeriod
+            + (col ^ ((row & 7) << 3));
+    } else {
+        constexpr int kPeriod = 64;
+        const int tile = dim / kPeriod;
+        const int col = dim % kPeriod;
+        const int slice = col / 16;
+        const int rotation = (((slice & 1) << 1) + ((slice & 2) >> 1)) * 2;
+        const int vec = (((row % 4) * 2 + (col % 16) / 8) ^ ((row / 4) & 1));
+        return tile * KT::kBlockM * kPeriod + slice * KT::kBlockM * 16 + (row / 4) * 64
+            + ((vec + rotation) % 8) * 8 + col % 8;
+    }
 }
 
 template<typename KT, bool ExtraFP4>
@@ -60,7 +100,12 @@ __forceinline__ __device__ float* scratch(char* smem) {
 template<typename KT, bool ExtraFP4, typename P>
 __forceinline__ __device__ void load_q(
     const P& p, int token, int h_k_idx, char* smem, int tidx) {
-    using Element = cutlass::bfloat16_t;
+    // Source Q in gmem is always BF16 (the producer writes bf16 activations);
+    // Element is the type stored in smem and consumed by the MMA.  They differ
+    // for the FP8-compute variant, which is why these are now two names.
+    using SrcElement = cutlass::bfloat16_t;
+    using Element = typename KT::Element;
+    constexpr bool kFp8Q = KT::QKV_FP8;
     constexpr int kBlockM = KT::kBlockM;
     constexpr int kParts = KT::kNThreads / kBlockM;
     constexpr int kChunks = KT::kHeadDim / 16;
@@ -71,7 +116,7 @@ __forceinline__ __device__ void load_q(
     const int part = h8 ? (tidx / 8) % kParts : tidx / kBlockM;
     const int head = h_k_idx * kBlockM + row;
     const bool live = head < p.real_heads;
-    const Element* src = reinterpret_cast<const Element*>(p.q_ptr)
+    const SrcElement* src = reinterpret_cast<const SrcElement*>(p.q_ptr)
         + int64_t(token) * p.stride_q_token + head * 16;
     Element* dst = reinterpret_cast<Element*>(smem);
     float sum = 0.0f;
@@ -85,15 +130,17 @@ __forceinline__ __device__ void load_q(
             raw[0] = __ldg(g);
             raw[1] = __ldg(g + 1);
         }
-        if constexpr (h8 && !P::kEnableNorm) {
+        // Raw BF16 passthrough (norm disabled, pre-RoPE region).  Only valid
+        // when smem holds BF16; the FP8 variant must quantize every chunk.
+        if constexpr (h8 && !P::kEnableNorm && !kFp8Q) {
             if (chunk < 28 || !live) {
-                *reinterpret_cast<uint4*>(dst + native_offset<kBlockM>(row, chunk * 16)) = raw[0];
-                *reinterpret_cast<uint4*>(dst + native_offset<kBlockM>(row, chunk * 16 + 8)) = raw[1];
+                *reinterpret_cast<uint4*>(dst + native_offset<KT>(row, chunk * 16)) = raw[0];
+                *reinterpret_cast<uint4*>(dst + native_offset<KT>(row, chunk * 16 + 8)) = raw[1];
                 continue;
             }
         }
         float x[16];
-        const Element* e = reinterpret_cast<const Element*>(raw);
+        const SrcElement* e = reinterpret_cast<const SrcElement*>(raw);
         #pragma unroll
         for (int i = 0; i < 16; ++i) x[i] = float(e[i]);
         if constexpr (P::kEnableNorm) {
@@ -112,13 +159,34 @@ __forceinline__ __device__ void load_q(
                 x[i + 1] = rotated.y;
             }
         }
-        #pragma unroll
-        for (int h = 0; h < 2; ++h) {
-            alignas(16) Element packed[8];
+        if constexpr (kFp8Q) {
+            // Quantize to E4M3 LAST, i.e. strictly after RoPE -- quantizing
+            // before RoPE lets the rotation amplify the quantization error,
+            // which presents as an accuracy collapse rather than a build error.
+            //
+            // The QK^T MMA (E4M3 x E4M3 -> F32) has no per-block scale operand,
+            // so Q stays un-scaled here and the tolerance is simply E4M3's
+            // dynamic range. Values are taken as-is (no amax normalization);
+            // the caller's Q is already activation-scale.
             #pragma unroll
-            for (int j = 0; j < 8; ++j) packed[j] = Element(x[h * 8 + j]);
-            *reinterpret_cast<uint4*>(dst + native_offset<kBlockM>(row, chunk * 16 + h * 8))
-                = *reinterpret_cast<const uint4*>(packed);
+            for (int h = 0; h < 2; ++h) {
+                alignas(16) cutlass::float_e4m3_t packed[8];
+                #pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    packed[j] = cutlass::float_e4m3_t::from_float(x[h * 8 + j]);
+                }
+                *reinterpret_cast<uint4*>(dst + native_offset<KT>(row, chunk * 16 + h * 8))
+                    = *reinterpret_cast<const uint4*>(packed);
+            }
+        } else {
+            #pragma unroll
+            for (int h = 0; h < 2; ++h) {
+                alignas(16) Element packed[8];
+                #pragma unroll
+                for (int j = 0; j < 8; ++j) packed[j] = Element(x[h * 8 + j]);
+                *reinterpret_cast<uint4*>(dst + native_offset<KT>(row, chunk * 16 + h * 8))
+                    = *reinterpret_cast<const uint4*>(packed);
+            }
         }
     }
     if constexpr (P::kEnableNorm) {
@@ -525,7 +593,10 @@ __forceinline__ __device__ void store_output(
     constexpr int kChunks = KT::kHeadDimV / 32;
     constexpr int MMA_ATOM_M = KT::USE_MMA_M8 ? 8 : 16;
     constexpr int MMA_ATOM_K_M = KT::USE_MMA_M8 ? 1 : 2;
-    static_assert(KT::CrossCut && !KT::QKV_FP8 && KT::kHeadDimV == 512);
+    // The old guard rejected FP8 outright.  The store path now handles the FP8
+    // accumulator order itself (permute_output_fp8 + EpiPerm store just below),
+    // so the invariant to assert is simply the CrossCut/V-extent contract.
+    static_assert(KT::CrossCut && KT::kHeadDimV == 512);
     const int tidx = threadIdx.x;
     const int warp = tidx / 32;
     const int lane = tidx % 32;
@@ -558,8 +629,25 @@ __forceinline__ __device__ void store_output(
     if constexpr (kBlockM != 16) __syncthreads();
 
     Tensor sO = make_tensor(make_smem_ptr(reinterpret_cast<float*>(smem)), typename KT::SmemLayoutO{});
+    // FP8 PV (gemm_pv_fp8_vdirect) leaves acc_o in the pi_n-interleaved order
+    // n = {4q, 4q+2, 4q+1, 4q+3}.  The two-part fix is: (a) swap the lane-local
+    // pairs here via permute_output_fp8, then (b) reinterpret the remaining
+    // q-dependent part with the EpiPerm CLayout -- i.e. store through a TiledMMA
+    // that only rewrites CLayout (TiledMmaSPStore), moving no data.  For BF16 the
+    // accumulator is already natural, so both steps are identity.
+    if constexpr (kPvFp8<KT>) {
+        flash::permute_output_fp8(acc_o);
+    }
     typename KT::TiledMma tiled_mma;
-    auto smem_tiled_copy_O = make_tiled_copy_C(typename KT::SmemCopyAtomOaccum{}, tiled_mma);
+    auto smem_tiled_copy_O = [&] {
+        if constexpr (kPvFp8<KT>) {
+            auto c = make_tiled_copy_C(typename KT::SmemCopyAtomOaccum{},
+                                       typename KT::TiledMmaSPStore{});
+            return c;
+        } else {
+            return make_tiled_copy_C(typename KT::SmemCopyAtomOaccum{}, tiled_mma);
+        }
+    }();
     auto smem_thr_copy_O = smem_tiled_copy_O.get_thread_slice(tidx);
     Tensor tOrO = smem_thr_copy_O.retile_S(acc_o);
     Tensor tOsO = smem_thr_copy_O.partition_D(sO);
@@ -726,7 +814,8 @@ fused_norm_rope_attn_rope_cast_decode_splitkv_kernel(
     }
 }
 
-template<int Heads, bool EnableNorm, bool ExtraFP4, bool PerTokenScale>
+template<int Heads, bool EnableNorm, bool ExtraFP4, bool PerTokenScale,
+         typename Elem = cutlass::bfloat16_t>
 void run_fused_norm_rope_attn_rope_cast_decode_splitkv_kernel_impl(
     const Params& params, const SplitKVParams& split) {
     static_assert(Heads == 8 || Heads == 64 || Heads == 128);
@@ -797,7 +886,7 @@ void run_fused_norm_rope_attn_rope_cast_decode_splitkv_kernel_impl(
     p.real_heads = Heads;
 
     IS_PAGE_POWER2(p.page_block_size, p.extra_page_block_size, [&] {
-        using KT = splitkv::Traits<Heads, kPagePow2>;
+        using KT = splitkv::Traits<Heads, kPagePow2, Elem>;
         constexpr size_t smem_size = splitkv::scratch_offset<KT, ExtraFP4>() + splitkv::scratch_bytes<KT>();
         static_assert(smem_size <= 256 * 1024);
         auto kernel = &fused_norm_rope_attn_rope_cast_decode_splitkv_kernel<KT, EnableNorm, ExtraFP4, PerTokenScale>;
@@ -841,6 +930,22 @@ void run_fused_norm_rope_attn_rope_cast_decode_splitkv_kernel(
         run_fused_norm_rope_attn_rope_cast_decode_splitkv_kernel_impl<Heads, EnableNorm, ExtraFP4, true>(params, split);
     } else {
         run_fused_norm_rope_attn_rope_cast_decode_splitkv_kernel_impl<Heads, EnableNorm, ExtraFP4, false>(params, split);
+    }
+}
+
+// V523-S22: FP8-compute variant (Q quantized to E4M3 after RoPE, QK^T on the
+// PPU1.5 E4M3xE4M3->F32 atom).  Same Params/launch contract as the BF16 entry
+// point above, so the runtime can pick between them with a flag; only the
+// element type of the attention kernel differs.
+template<int Heads, bool EnableNorm, bool ExtraFP4>
+void run_fused_norm_rope_attn_rope_cast_decode_splitkv_fp8_kernel(
+    const Params& params, const SplitKVParams& split) {
+    if (params.per_token_scale) {
+        run_fused_norm_rope_attn_rope_cast_decode_splitkv_kernel_impl<
+            Heads, EnableNorm, ExtraFP4, true, cutlass::float_e4m3_t>(params, split);
+    } else {
+        run_fused_norm_rope_attn_rope_cast_decode_splitkv_kernel_impl<
+            Heads, EnableNorm, ExtraFP4, false, cutlass::float_e4m3_t>(params, split);
     }
 }
 

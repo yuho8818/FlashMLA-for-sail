@@ -451,6 +451,17 @@ struct KVCacheG2SFP8 {
     using SmemCopyAtomK = Copy_Atom<SmemCopyOpK, Element>;
     using SmemCopyOpV = PPU_TSM_LD_SWZL<Element, kBlockN, kBlockKSmem, true, true, kHeadDimV / kBlockKSmem>;
     using SmemCopyAtomV = Copy_Atom<SmemCopyOpV, Element>;
+
+    // V523-S22: FP8-compute variant of the K atom.  When the attention GEMMs
+    // consume E4M3 directly, K is read from the E4M3 staging
+    // (SmemLayoutKNopeFP8) that load_g2s_async already fills, so the atom must
+    // be typed for E4M3 with the 128-wide swizzle row (kBlockKSmemFp8) rather
+    // than the BF16 64-wide one.  This is the non-transposed load, which the SDK
+    // implements generically for any element type -- no b8 transposing ldmatrix
+    // is involved (that limitation only affects V).
+    using SmemCopyOpKFp8 = PPU_TSM_LD_SWZL<ElementKVCache, kBlockN, kBlockKSmemFp8,
+                                          true, false, kHeadDim / kBlockKSmemFp8>;
+    using SmemCopyAtomKFp8 = Copy_Atom<SmemCopyOpKFp8, ElementKVCache>;
 #endif
 
     using SmemLayoutKNopeFP8Np = decltype(tile_to_shape(SmemLayoutAtomK{}, Shape<Int<kBlockN>, Int<kHeadDimNope>>{}));
