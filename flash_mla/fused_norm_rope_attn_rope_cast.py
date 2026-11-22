@@ -105,6 +105,7 @@ def decode(
     extra_k_cache: Optional[torch.Tensor] = None,
     extra_indices_in_kvcache: Optional[torch.Tensor] = None,
     extra_topk_length: Optional[torch.Tensor] = None,
+    fp8_compute: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Fused Decoding kernel: Q Norm + Q RoPE + Core Attn (decode, with paged FP8 KV cache) + O RoPE + O cast to FP8, for DeepSeek-V4.1
@@ -145,6 +146,9 @@ def decode(
         extra_k_cache: optional, [extra_num_blocks, extra_page_block_size, h_kv, bytes_per_token]. Secondary paged KV cache; it uses the fp8_e4m3 format of `k_cache`, or the fp4 e2m1 / per-16 e4m3 format (288 bytes per token), which is only allowed here
         extra_indices_in_kvcache: optional, [s_q, extra_topk], int32. Indices into the extra KV cache
         extra_topk_length: optional, [s_q], int32. Actual valid extra topk count of the request
+        fp8_compute: bool. Run the five-in-one's GEMMs on the PPU1.5
+            E4M3xE4M3->F32 atom instead of the BF16 atom (Q is quantized to E4M3
+            after RoPE). Kernel selection only; off by default.
 
     Returns:
         - out_fp8: [s_q, n_wv_group, wv_group_size * d_v], fp8_e4m3, quantized attention result (wv_group_size = h_q / n_wv_group)
@@ -156,7 +160,8 @@ def decode(
         attn_sink, topk_length,
         extra_k_cache, extra_indices_in_kvcache, extra_topk_length,
         enable_q_norm, rms_norm_eps, token_positions, is_rope_neox_style, rope_dim, cos_sin_cache,
-        n_wv_group, num_per_channels, use_tma_aligned_col_major_sf, round_sf, use_packed_ue8m0
+        n_wv_group, num_per_channels, use_tma_aligned_col_major_sf, round_sf, use_packed_ue8m0,
+        fp8_compute,
     )
     return out_fp8, out_sf, lse
 
