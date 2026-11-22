@@ -245,7 +245,7 @@ __forceinline__ __device__ void compute_attn_fp8_sparse_splitkv(
     // count -- only the swizzle row width differs (128 vs 64) -- so this is a
     // reinterpretation of the buffer the g2s loader already filled, not a
     // second copy.  sVt then aliases the very same bytes as before.
-    using SmemLayoutKActive = std::conditional_t<Kernel_traits::HasFp8Mma,
+    using SmemLayoutKActive = std::conditional_t<Kernel_traits::QKV_FP8,
         typename KVCacheGmem::SmemLayoutKNopeFP8, SmemLayoutKNoAiu>;
     Tensor sK = make_tensor(sQ.data() + (Kernel_traits::Share_Q_K_smem ? 0 : size(sQ)), SmemLayoutKActive{});
     Tensor sVt = make_tensor(sK.data(), SmemLayoutVtransposedNoAiu{});
@@ -359,7 +359,7 @@ __forceinline__ __device__ void compute_attn_fp8_sparse_splitkv(
     // FP8 compute reads K straight out of the E4M3 staging, so both the smem
     // layout and the copy atom switch to the FP8 forms (128-wide swizzle row).
     auto smem_tiled_copy_K = [&] {
-        if constexpr (Kernel_traits::HasFp8Mma) {
+        if constexpr (Kernel_traits::QKV_FP8) {
             return make_tiled_copy_B(typename KVCacheGmem::SmemCopyAtomKFp8{}, tiled_mma_s);
         } else {
             return make_tiled_copy_B(typename KVCacheGmem::SmemCopyAtomK{}, tiled_mma_s);
@@ -504,7 +504,7 @@ __forceinline__ __device__ void compute_attn_fp8_sparse_splitkv(
             // in-place dequantize-to-BF16 step must not run.  Note the V4.1-FP8
             // cache row holds K and V as the same 512 E4M3 values, so K and V
             // cannot carry different precisions -- they are one buffer.
-            if constexpr (!Kernel_traits::HasFp8Mma) {
+            if constexpr (!Kernel_traits::QKV_FP8) {
                 kvload_gmem.template cvt_fp8_store<!IsExtraFP4 || RegisterFP4>(sK_cvt, sK_cvt, tKrScale);
             }
         }
@@ -563,7 +563,7 @@ __forceinline__ __device__ void compute_attn_fp8_sparse_splitkv(
         }
 
         auto tOsVt_curr = make_tensor(tOsVt.data() + buf_idx * size(sK), layout(tOsVt));
-        if constexpr (Kernel_traits::HasFp8Mma) {
+        if constexpr (Kernel_traits::QKV_FP8) {
             // FP8 PV: V is read straight out of the E4M3 staging as bf16 pairs
             // (this device has no b8 transposing ldmatrix), and the resulting
             // pi_n column interleave is undone outside the main loop.  See
@@ -1019,7 +1019,7 @@ __forceinline__ __device__ void compute_attn_bf16_sparse_splitkv(
         }
 
         auto tOsVt_curr = make_tensor(tOsVt.data() + buf_idx * size(sK), layout(tOsVt));
-        if constexpr (Kernel_traits::HasFp8Mma) {
+        if constexpr (Kernel_traits::QKV_FP8) {
             flash::gemm_pv_fp8_vdirect<Kernel_traits>(acc_o, tOrP, tOrVt, tOsP,
                 sK.data().get(), buf_idx, tiled_mma_o, smem_tiled_copy_P, smem_thr_copy_P);
         } else {

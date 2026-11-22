@@ -56,11 +56,6 @@ struct OutputParams : Params {
 template<FwdMode Mode, int Heads, bool EnableNorm, bool ExtraFP4>
 void run_fused_norm_rope_attn_rope_cast_fwd_kernel(const Params& params);
 
-// V523-S22: FP8-compute variant of the decode splitkv kernel (E4M3 QK^T and PV).
-template<int Heads, bool EnableNorm, bool ExtraFP4>
-void run_fused_norm_rope_attn_rope_cast_decode_splitkv_fp8_kernel(
-    const Params& params, const SplitKVParams& split);
-
 template<bool EnableNorm>
 void run_fused_norm_rope_attn_rope_cast_prefill_hs64(const Params& params);
 
@@ -81,6 +76,12 @@ struct SplitKVParams {
 template<int Heads, bool EnableNorm, bool ExtraFP4>
 void run_fused_norm_rope_attn_rope_cast_decode_splitkv_kernel(
     const Params& params, const SplitKVParams& splitkv);
+
+// V523-S22: FP8-compute variant of the decode splitkv kernel (E4M3 QK^T and PV).
+// Declared after SplitKVParams, which it takes by reference.
+template<int Heads, bool EnableNorm, bool ExtraFP4>
+void run_fused_norm_rope_attn_rope_cast_decode_splitkv_fp8_kernel(
+    const Params& params, const SplitKVParams& split);
 
 template<bool Norm>
 bool run_fused_norm_rope_attn_rope_cast_decode_native_wi(

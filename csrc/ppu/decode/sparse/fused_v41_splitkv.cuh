@@ -43,11 +43,36 @@ using TraitsFp8 = Traits<Heads, PagePow2, cutlass::float_e4m3_t>;
 // gemm_pv_fp8_vdirect) leaves acc_o in the pi_n-interleaved column order and so
 // requires permute_output_fp8 plus an EpiPerm-aware epilogue.
 template<typename KT>
-static constexpr bool kPvFp8 = KT::HasFp8Mma;
+static constexpr bool kPvFp8 = KT::QKV_FP8;
+
+// Smem the five-in-one actually needs for its CrossCut store paths.
+//
+// Those paths stage O through SmemLayoutO at fp32 width and then place
+// per-warp/per-group scratch immediately after that staging area, i.e. they
+// consume up to
+//     cosize(SmemLayoutO)*4 + (kNWarps + kBlockM/8)*4 + kBlockM*1
+// bytes from the base of the smem block.
+//
+// kernel_traits' own kSmemSizeAccum is the max of the QK/CrossCut region and
+// the fp32 O region, and under BF16 the QK term happened to exceed the above by
+// enough to hide the scratch.  Under FP8 the QK region shrinks and the fp32 O
+// region becomes the binding term, leaving the scratch no room.  Widening
+// kSmemSizeAccum globally is not an option -- several unrelated instantiations
+// (e.g. the dense 576/512 kBlockM=128 CrossCut traits) sit within a few hundred
+// bytes of the 256 KiB cap -- so the requirement is stated here instead and the
+// five-in-one's launcher uses this value.
+template<typename KT>
+constexpr size_t kSmemBytesRequired() {
+    constexpr size_t kStage = cute::cosize(typename KT::SmemLayoutO{}) * sizeof(float);
+    constexpr size_t kScratch = (KT::kNThreads / 32 + KT::kBlockM / 8) * sizeof(float)
+                              + KT::kBlockM * sizeof(bool);
+    constexpr size_t kStore = kStage + kScratch;
+    return kStore > size_t(KT::kSmemSizeAccum) ? kStore : size_t(KT::kSmemSizeAccum);
+}
 
 template<typename KT, bool ExtraFP4>
 constexpr size_t scratch_offset() {
-    return KT::kSmemSizeAccum + KT::kBlockN * 2 * sizeof(int)
+    return kSmemBytesRequired<KT>() + KT::kBlockN * 2 * sizeof(int)
         + (ExtraFP4 && KT::kBlockM > 32 ? flash::kFp4LutEntries * sizeof(uint32_t) : 0);
 }
 
@@ -64,17 +89,18 @@ __forceinline__ __device__ float2 apply_rope(float2 x, float c, float s) {
 // swizzle in hardware, so this function IS the layout contract -- it must match
 // the swizzle mode the SmemCopyOpQ instance was built with.
 //
-// The selector must be the SAME one that picks kBlockKSmem/the Q copy atom
-// (HasFp8Mma), not ACOMPUTE_VERSION: this TU is compiled at 10000 for the BF16
-// arm and at 10500 for the FP8 arm, so keying on ACOMPUTE_VERSION would flip
-// both the period AND the branch independently of the atom actually in use.
+// The selector is QKV_FP8, the same one that picks kBlockKSmem and the Q copy
+// atom, so the offset and the atom can never disagree.  Keying on
+// ACOMPUTE_VERSION instead would flip the period independently of the atom in
+// use, because this TU is compiled at 10000 for the BF16 arm and at 10500 for
+// the FP8 arm.
 //   BF16 (kBlockKSmem=64): 64-wide period, XOR swizzle
 //   FP8  (kBlockKSmem=128): 128-wide period, XOR swizzle on 128
 // Getting this wrong does not fail to compile; it silently permutes Q and shows
 // up as an accuracy collapse.
 template<typename KT>
 __forceinline__ __device__ int native_offset(int row, int dim) {
-    if constexpr (KT::HasFp8Mma) {
+    if constexpr (KT::QKV_FP8) {
         constexpr int kPeriod = KT::kBlockKSmem;   // 128 for FP8
         const int tile = dim / kPeriod;
         const int col = dim % kPeriod;
@@ -247,7 +273,7 @@ __forceinline__ __device__ void store_per_token_output(
     constexpr size_t kStageBytes = cute::cosize(typename KT::SmemLayoutO{}) * sizeof(float);
     static_assert(KT::kBlockM % 8 == 0 && KT::kHeadDimV == 512);
     static_assert(KT::kNThreads % kGroups == 0 && kThreadsPerGroup % 32 == 0);
-    static_assert(kStageBytes + (kWarps + kGroups) * sizeof(float) <= KT::kSmemSizeAccum);
+    static_assert(kStageBytes + (kWarps + kGroups) * sizeof(float) <= kSmemBytesRequired<KT>());
     float* partials = reinterpret_cast<float*>(smem + kStageBytes);
     float* inverses = partials + kWarps;
     const int tidx = threadIdx.x;
@@ -604,8 +630,10 @@ __forceinline__ __device__ void store_output(
     constexpr size_t kStageBytes = cute::cosize(typename KT::SmemLayoutO{}) * sizeof(float);
     constexpr size_t kPartialsBytes = (KT::kNThreads / 32 + kBlockM / 8) * sizeof(float);
     if constexpr (kDeferredLSE)
-        static_assert(kStageBytes + kPartialsBytes + kBlockM * sizeof(bool) <= KT::kSmemSizeAccum);
-    bool* row_valid = reinterpret_cast<bool*>(smem + KT::kSmemSizeAccum - kBlockM * sizeof(bool));
+        static_assert(kStageBytes + kPartialsBytes + kBlockM * sizeof(bool) <= kSmemBytesRequired<KT>());
+    // Sits at the very end of the region the launcher allocates, which is
+    // kSmemBytesRequired<KT>() (>= KT::kSmemSizeAccum).
+    bool* row_valid = reinterpret_cast<bool*>(smem + kSmemBytesRequired<KT>() - kBlockM * sizeof(bool));
     auto publish_lse = [&](auto local_only) {
     if (warp < KT::AtomLayoutQ && lane % 4 == 0) {
         const int row_base = warp * MMA_ATOM_M + lane / 4;
