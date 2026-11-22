@@ -240,13 +240,21 @@ __forceinline__ __device__ void compute_attn_fp8_sparse_splitkv(
                             make_stride(params.q_row_stride, _1{}));
 
     Tensor sQ = make_tensor(make_smem_ptr(reinterpret_cast<Element *>(smem_)), typename Kernel_traits::SmemLayoutQ{});
-    // FP8 compute reinterprets the same smem region with the E4M3 staging
-    // layout.  Both layouts cover the identical (kBlockN, kHeadDim) element
-    // count -- only the swizzle row width differs (128 vs 64) -- so this is a
-    // reinterpretation of the buffer the g2s loader already filled, not a
-    // second copy.  sVt then aliases the very same bytes as before.
-    using SmemLayoutKActive = std::conditional_t<Kernel_traits::QKV_FP8,
-        typename KVCacheGmem::SmemLayoutKNopeFP8, SmemLayoutKNoAiu>;
+    // FP8 compute reads K straight out of the E4M3 staging that load_g2s_async
+// filled, so the smem view must use the FP8 element type.  It must ALSO use the
+// same tiling that gemm_pv_fp8_vdirect indexes, because V is read out of this
+// same buffer: V-direct computes
+//     cube = (kv0/kCubeH) * (kHeadDim/kCubeWFp8) + j0/kCubeWFp8
+// i.e. it assumes Kernel_traits' own FP8 K tiling (kBlockKSmem=128 columns per
+// cube).  KVCacheGmem::SmemLayoutKNopeFP8 looks similar but bakes in a
+// Swizzle<3,4,3> and a different cube order, so using it here made V-direct read
+// the wrong elements -- which showed up as garbage attention output.
+//
+// Kernel_traits::SmemLayoutK is the layout the dense FP8 path pairs with
+// V-direct, and it covers the same (kBlockN, kHeadDim) element count as the BF16
+// layout, so the surrounding offsets (sK_double, sP, ...) are unchanged.
+using SmemLayoutKActive = std::conditional_t<Kernel_traits::QKV_FP8,
+    typename Kernel_traits::SmemLayoutK, SmemLayoutKNoAiu>;
     Tensor sK = make_tensor(sQ.data() + (Kernel_traits::Share_Q_K_smem ? 0 : size(sQ)), SmemLayoutKActive{});
     Tensor sVt = make_tensor(sK.data(), SmemLayoutVtransposedNoAiu{});
     Tensor sVtNoSwizzle = make_tensor(sK.data(), typename Kernel_traits::SmemLayoutVtransposedNoSwizzle{});
@@ -356,11 +364,13 @@ __forceinline__ __device__ void compute_attn_fp8_sparse_splitkv(
     auto smem_thr_copy_V = smem_tiled_copy_V.get_thread_slice(tidx);
     auto tOsVt = smem_thr_copy_V.partition_S(sVt);
 #else
-    // FP8 compute reads K straight out of the E4M3 staging, so both the smem
-    // layout and the copy atom switch to the FP8 forms (128-wide swizzle row).
+    // The K copy atom must match the K smem layout.  For FP8 that is
+// Kernel_traits::SmemCopyAtomK, the same atom the dense FP8 path pairs with the
+// same layout and with gemm_pv_fp8_vdirect.  Inventing a separate FP8 atom here
+// gave a combination whose tiling disagreed with V-direct's cube indexing.
     auto smem_tiled_copy_K = [&] {
         if constexpr (Kernel_traits::QKV_FP8) {
-            return make_tiled_copy_B(typename KVCacheGmem::SmemCopyAtomKFp8{}, tiled_mma_s);
+            return make_tiled_copy_B(typename Kernel_traits::SmemCopyAtomK{}, tiled_mma_s);
         } else {
             return make_tiled_copy_B(typename KVCacheGmem::SmemCopyAtomK{}, tiled_mma_s);
         }
