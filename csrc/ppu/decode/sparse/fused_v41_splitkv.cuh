@@ -90,22 +90,26 @@ __forceinline__ __device__ float2 apply_rope(float2 x, float c, float s) {
 // the swizzle mode the SmemCopyOpQ instance was built with.
 //
 // The selector is QKV_FP8, the same one that picks kBlockKSmem and the Q copy
-// atom, so the offset and the atom can never disagree.  Keying on
-// ACOMPUTE_VERSION instead would flip the period independently of the atom in
-// use, because this TU is compiled at 10000 for the BF16 arm and at 10500 for
-// the FP8 arm.
-//   BF16 (kBlockKSmem=64): 64-wide period, XOR swizzle
-//   FP8  (kBlockKSmem=128): 128-wide period, XOR swizzle on 128
+// atom, so the offset and the atom can never disagree.
+//
+// FP8 geometry is taken from the working native FP8 attention kernel, which
+// documents it directly (csrc/ppu/sparse_native_fp8_attention.cuh):
+//     AtomS8 = Swizzle<2,4,3> o Layout<Shape<_8,_64>, Stride<_64,_1>>
+//     cube (r/8, c/64) lands at ((c/64)*(rows/8) + r/8)*512 + (r%8)*64 + (c%64)
+// i.e. a 64-column period with a 2-bit swizzle, NOT the 128-wide 3-bit form.
 // Getting this wrong does not fail to compile; it silently permutes Q and shows
-// up as an accuracy collapse.
+// up as an accuracy collapse (observed exactly that way before this fix).
 template<typename KT>
 __forceinline__ __device__ int native_offset(int row, int dim) {
     if constexpr (KT::QKV_FP8) {
-        constexpr int kPeriod = KT::kBlockKSmem;   // 128 for FP8
-        const int tile = dim / kPeriod;
-        const int col = dim % kPeriod;
-        return tile * KT::kBlockM * kPeriod + row * kPeriod
-            + (col ^ ((row & 7) << 3));
+        // Swizzle<2,4,3> over an 8x64 atom: XOR bits [4,6) with bits [7,9).
+        constexpr int kPeriod = 64;
+        constexpr int kRows = KT::kBlockM;
+        const int cube = ((dim / kPeriod) * (kRows / 8) + row / 8) * 512;
+        const int inner = (row % 8) * kPeriod + (dim % kPeriod);
+        const int swizzled = (inner & ~(0x3 << 4))
+            | ((((inner >> 4) & 0x3) ^ ((inner >> 7) & 0x3)) << 4);
+        return cube + swizzled;
     } else {
         constexpr int kPeriod = 64;
         const int tile = dim / kPeriod;
