@@ -85,31 +85,31 @@ __forceinline__ __device__ float2 apply_rope(float2 x, float c, float s) {
     return float2{fmaf(x.x, c, -x.y * s), fmaf(x.x, s, x.y * c)};
 }
 
-// Q smem swizzle.  The TSM loader takes smem_base + coordinates and applies the
+// Q smem layout.  The TSM loader takes smem_base + coordinates and applies the
 // swizzle in hardware, so this function IS the layout contract -- it must match
-// the swizzle mode the SmemCopyOpQ instance was built with.
+// the layout the Q copy atom partitions against.
 //
 // The selector is QKV_FP8, the same one that picks kBlockKSmem and the Q copy
 // atom, so the offset and the atom can never disagree.
 //
-// FP8 geometry is taken from the working native FP8 attention kernel, which
-// documents it directly (csrc/ppu/sparse_native_fp8_attention.cuh):
-//     AtomS8 = Swizzle<2,4,3> o Layout<Shape<_8,_64>, Stride<_64,_1>>
-//     cube (r/8, c/64) lands at ((c/64)*(rows/8) + r/8)*512 + (r%8)*64 + (c%64)
-// i.e. a 64-column period with a 2-bit swizzle, NOT the 128-wide 3-bit form.
-// Getting this wrong does not fail to compile; it silently permutes Q and shows
-// up as an accuracy collapse (observed exactly that way before this fix).
+// FP8: Kernel_traits::SmemLayoutQ is built from the USE_AIU atom
+//     Layout<Shape<_8, kBlockKSmem>, Stride<kBlockKSmem,_1>>   (128 columns for fp8)
+// tiled to (kBlockM, kHeadDim).  That is a PLAIN strided layout -- there is no
+// software swizzle, the hardware supplies it -- so the offset is simply
+//     (dim/128) * (kBlockM/8) * (8*128) + row*128 + dim%128
+// which reduces to the expression below.
+//
+// Do NOT copy the native fp8 attention kernel's AtomS8 here: that kernel uses
+// Swizzle<2,4,3> over a 64-wide atom, which is a different layout (verified:
+// 4064/4096 offsets differ).  Getting this wrong does not fail to compile; it
+// silently permutes Q and shows up as fluent-looking garbage output.
 template<typename KT>
 __forceinline__ __device__ int native_offset(int row, int dim) {
     if constexpr (KT::QKV_FP8) {
-        // Swizzle<2,4,3> over an 8x64 atom: XOR bits [4,6) with bits [7,9).
-        constexpr int kPeriod = 64;
-        constexpr int kRows = KT::kBlockM;
-        const int cube = ((dim / kPeriod) * (kRows / 8) + row / 8) * 512;
-        const int inner = (row % 8) * kPeriod + (dim % kPeriod);
-        const int swizzled = (inner & ~(0x3 << 4))
-            | ((((inner >> 4) & 0x3) ^ ((inner >> 7) & 0x3)) << 4);
-        return cube + swizzled;
+        constexpr int kCw = 128;                 // kBlockKSmem
+        constexpr int kCube = 8 * kCw;           // elements in one 8-row cube
+        const int cubes_per_row = KT::kBlockM / 8;
+        return (dim / kCw) * cubes_per_row * kCube + row * kCw + (dim % kCw);
     } else {
         constexpr int kPeriod = 64;
         const int tile = dim / kPeriod;
