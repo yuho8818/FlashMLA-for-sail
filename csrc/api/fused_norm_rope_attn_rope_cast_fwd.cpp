@@ -273,11 +273,18 @@ void launch_fused_decode_splitkv(const Params& raw, const at::Tensor& q) {
     // V523-S22: the FP8-compute arm differs from the BF16 arm only here.  Both
     // share the same launcher, params and grid; only the kernel's element type
     // (and therefore the MMA atom) changes.
-    if (p.fp8_compute) {
-        fused::core_attn::run_fused_norm_rope_attn_rope_cast_decode_splitkv_fp8_kernel<Heads, EnableNorm, ExtraFP4>(p, splitkv);
-    } else {
-        fused::core_attn::run_fused_norm_rope_attn_rope_cast_decode_splitkv_kernel<Heads, EnableNorm, ExtraFP4>(p, splitkv);
+    //
+    // Only Heads == 64 has an FP8 instantiation, so the branch is compiled for
+    // that case alone -- otherwise the linker demands symbols for the H8/H128
+    // variants too.  The entry point rejects fp8_compute for other head counts,
+    // so reaching the else path with the flag set cannot happen at runtime.
+    if constexpr (Heads == 64) {
+        if (p.fp8_compute) {
+            fused::core_attn::run_fused_norm_rope_attn_rope_cast_decode_splitkv_fp8_kernel<Heads, EnableNorm, ExtraFP4>(p, splitkv);
+            return;
+        }
     }
+    fused::core_attn::run_fused_norm_rope_attn_rope_cast_decode_splitkv_kernel<Heads, EnableNorm, ExtraFP4>(p, splitkv);
 }
 
 template<int Heads, bool EnableNorm>
