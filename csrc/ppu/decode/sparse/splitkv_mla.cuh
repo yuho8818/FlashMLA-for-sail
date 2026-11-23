@@ -526,7 +526,12 @@ using SmemLayoutKActive = std::conditional_t<Kernel_traits::QKV_FP8,
                 // directly.  S22 guarded only the non-ExtraFP4 branch below and
                 // missed this one, so every ExtraFP4 layer silently fed bf16
                 // bytes to an fp8 MMA.
-                if constexpr (!Kernel_traits::QKV_FP8) {
+                if constexpr (Kernel_traits::QKV_FP8) {
+                    // V523-S26: apply the V4.1 per-32-channel scale but keep the
+                    // result in E4M3 -- the QK^T MMA and V-direct both read E4M3,
+                    // and dropping the scale made every score ~60x too large.
+                    kvload_gmem.template scale_fp8_inplace(sK_cvt, tKrScale);
+                } else {
                     kvload_gmem.template cvt_fp8_store<!IsExtraFP4 || RegisterFP4>(sK_cvt, sK_cvt, tKrScale);
                 }
             } else {
@@ -538,7 +543,9 @@ using SmemLayoutKActive = std::conditional_t<Kernel_traits::QKV_FP8,
             // in-place dequantize-to-BF16 step must not run.  Note the V4.1-FP8
             // cache row holds K and V as the same 512 E4M3 values, so K and V
             // cannot carry different precisions -- they are one buffer.
-            if constexpr (!Kernel_traits::QKV_FP8) {
+            if constexpr (Kernel_traits::QKV_FP8) {
+                kvload_gmem.template scale_fp8_inplace(sK_cvt, tKrScale);
+            } else {
                 kvload_gmem.template cvt_fp8_store<!IsExtraFP4 || RegisterFP4>(sK_cvt, sK_cvt, tKrScale);
             }
         }
