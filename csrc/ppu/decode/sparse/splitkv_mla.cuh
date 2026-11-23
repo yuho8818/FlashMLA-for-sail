@@ -521,7 +521,14 @@ using SmemLayoutKActive = std::conditional_t<Kernel_traits::QKV_FP8,
         auto sK_cvt = make_tensor(sK.data() + buf_idx * size(sK), layout(sK));
         if constexpr (IsExtraFP4) {
             if (block_idx < ori_block_max) {
-                kvload_gmem.template cvt_fp8_store<!IsExtraFP4 || RegisterFP4>(sK_cvt, sK_cvt, tKrScale);
+                // V523-S26: the fp8-compute path must NOT dequantize the staged
+                // E4M3 to bf16 -- the QK^T MMA and V-direct both consume E4M3
+                // directly.  S22 guarded only the non-ExtraFP4 branch below and
+                // missed this one, so every ExtraFP4 layer silently fed bf16
+                // bytes to an fp8 MMA.
+                if constexpr (!Kernel_traits::QKV_FP8) {
+                    kvload_gmem.template cvt_fp8_store<!IsExtraFP4 || RegisterFP4>(sK_cvt, sK_cvt, tKrScale);
+                }
             } else {
                 fp4load_gmem.cvt_fp4_store(sK_cvt);
             }
