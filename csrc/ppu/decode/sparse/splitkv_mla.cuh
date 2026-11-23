@@ -89,7 +89,13 @@ __forceinline__ __device__ void compute_attn_fp8_sparse_splitkv(
         __syncthreads();
     }
 
-    using KVCacheGmem = KVCacheG2SFP8<kBlockN, Kernel_traits::kNThreads, kHeadDim, IsV41FP8>;
+    // V523-S23: when the GEMMs run in fp8, K is consumed straight out of the E4M3
+    // staging by gemm_pv_fp8_vdirect, so the loader must WRITE the tile in the
+    // walk V-direct indexes (plain (8,128) tiles, 8192 B cubes).
+    // The default (Swizzle<3,4,3>, 1024 B cubes) is right for the bf16 path,
+    // which dequantizes the staging in place before use.
+    using KVCacheGmem = KVCacheG2SFP8<kBlockN, Kernel_traits::kNThreads, kHeadDim, IsV41FP8,
+                                      /*Fp8VDirectK=*/Kernel_traits::QKV_FP8>;
 
     using ElementKVCache = typename KVCacheGmem::ElementKVCache;
     using SmemLayoutKNoAiu = typename KVCacheGmem::SmemLayoutK;
@@ -341,7 +347,18 @@ using SmemLayoutKActive = std::conditional_t<Kernel_traits::QKV_FP8,
         __syncthreads();
     }
 
-    auto smem_tiled_copy_S = make_tiled_copy_C(typename Kernel_traits::SmemCopyAtomS{}, tiled_mma_s);
+    // V523-S23: for fp8 the QK^T accumulator is produced by the V-direct atom in
+    // pi_k order, so the sP store must use the EpiPerm twin of TiledMmaS --
+    // exactly as the dense fp8 path does.  This is the atom's documented purpose
+    // ("EpiPerm CLayout for the pi_k sP order"); it is NOT for the O store.
+    auto smem_tiled_copy_S = [&] {
+        if constexpr (Kernel_traits::QKV_FP8) {
+            return make_tiled_copy_C(typename Kernel_traits::SmemCopyAtomS{},
+                                     typename Kernel_traits::TiledMmaSPStore{});
+        } else {
+            return make_tiled_copy_C(typename Kernel_traits::SmemCopyAtomS{}, tiled_mma_s);
+        }
+    }();
     auto smem_thr_copy_S = smem_tiled_copy_S.get_thread_slice(tidx);
     Tensor tSsS = smem_thr_copy_S.partition_D(sP);
 
@@ -840,7 +857,18 @@ __forceinline__ __device__ void compute_attn_bf16_sparse_splitkv(
         __syncthreads();
     }
 
-    auto smem_tiled_copy_S = make_tiled_copy_C(typename Kernel_traits::SmemCopyAtomS{}, tiled_mma_s);
+    // V523-S23: for fp8 the QK^T accumulator is produced by the V-direct atom in
+    // pi_k order, so the sP store must use the EpiPerm twin of TiledMmaS --
+    // exactly as the dense fp8 path does.  This is the atom's documented purpose
+    // ("EpiPerm CLayout for the pi_k sP order"); it is NOT for the O store.
+    auto smem_tiled_copy_S = [&] {
+        if constexpr (Kernel_traits::QKV_FP8) {
+            return make_tiled_copy_C(typename Kernel_traits::SmemCopyAtomS{},
+                                     typename Kernel_traits::TiledMmaSPStore{});
+        } else {
+            return make_tiled_copy_C(typename Kernel_traits::SmemCopyAtomS{}, tiled_mma_s);
+        }
+    }();
     auto smem_thr_copy_S = smem_tiled_copy_S.get_thread_slice(tidx);
     Tensor tSsS = smem_thr_copy_S.partition_D(sP);
 

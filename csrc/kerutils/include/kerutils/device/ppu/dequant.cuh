@@ -407,7 +407,16 @@ struct KVCacheGmemFP8 {
 
 };
 
-template<int kBlockN, int kNThreads, int kHeadDim_, bool IsV41FP8_ = false>
+// V523-S23: Fp8VDirectK selects the fp8 K staging layout that
+// gemm_pv_fp8_vdirect indexes.  V-direct reads the tile as CUBE_H=64 rows x
+// CUBE_W=64 bf16 lanes (8192 B) with cube = (kv/64)*kVTilesPerRow + head/128,
+// which is the plain tile_to_shape((8,128), (kBlockN, kHeadDimV)) walk -- i.e.
+// no software Swizzle, the TSM hardware applies the swizzle itself.  The default
+// layout below (Swizzle<3,4,3>, 1024 B cubes) does not match that walk, so an
+// fp8-compute consumer that reads K through V-direct must opt in.  Consumers
+// that only dequantize to bf16 (the default) are unaffected.
+template<int kBlockN, int kNThreads, int kHeadDim_, bool IsV41FP8_ = false,
+         bool Fp8VDirectK_ = false>
 struct KVCacheG2SFP8 {
     using ElementKVCache = cutlass::float_e4m3_t;
     using Element = cutlass::bfloat16_t;
@@ -440,8 +449,14 @@ struct KVCacheG2SFP8 {
         make_layout(Shape<Int<kHeadDimV>, Int<kBlockN>>{}, GenRowMajor{})));
 
     // smem for G2S
-    using SmemLayoutAtomFP8 = decltype(composition(Swizzle<3, 4, 3>{},
+    static constexpr bool Fp8VDirectK = Fp8VDirectK_;
+    using SmemLayoutAtomFP8Swizzled = decltype(composition(Swizzle<3, 4, 3>{},
         Layout<Shape<_8, Int<128>>, Stride<Int<128>, _1>>{}));
+    // Plain 8x128 atom: same 128-byte row (so swzl_mode is unchanged at 0) but
+    // the tile walk V-direct indexes.  See the Fp8VDirectK note above.
+    using SmemLayoutAtomFP8Plain = Layout<Shape<_8, Int<128>>, Stride<Int<128>, _1>>;
+    using SmemLayoutAtomFP8 = std::conditional_t<Fp8VDirectK_,
+        SmemLayoutAtomFP8Plain, SmemLayoutAtomFP8Swizzled>;
     using SmemLayoutKNopeFP8 = decltype(tile_to_shape(SmemLayoutAtomFP8{}, Shape<Int<kBlockN>, Int<kHeadDimV>>{}));
     using SmemLayoutKNopeBF16 = decltype(tile_to_shape(SmemLayoutAtomK{}, Shape<Int<kBlockN>, Int<kHeadDimV>>{}));
     using SmemLayoutKRope = decltype(tile_to_shape(SmemLayoutAtomK{}, Shape<Int<kBlockN>, Int<kHeadDimRope>>{}));

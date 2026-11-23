@@ -670,16 +670,13 @@ __forceinline__ __device__ void store_output(
     if constexpr (kPvFp8<KT>) {
         flash::permute_output_fp8(acc_o);
     }
+    // V523-S23: the O store uses the NATURAL tiled_mma.  permute_output_fp8 above
+    // has already moved acc_o into the order the natural partitioning expects,
+    // which is how the dense fp8 path stores O too.  An earlier revision also
+    // swapped in TiledMmaSPStore here, double-applying the permutation -- that
+    // atom is for the pi_k sP store, not for O (see kernel_traits.h).
     typename KT::TiledMma tiled_mma;
-    auto smem_tiled_copy_O = [&] {
-        if constexpr (kPvFp8<KT>) {
-            auto c = make_tiled_copy_C(typename KT::SmemCopyAtomOaccum{},
-                                       typename KT::TiledMmaSPStore{});
-            return c;
-        } else {
-            return make_tiled_copy_C(typename KT::SmemCopyAtomOaccum{}, tiled_mma);
-        }
-    }();
+    auto smem_tiled_copy_O = make_tiled_copy_C(typename KT::SmemCopyAtomOaccum{}, tiled_mma);
     auto smem_thr_copy_O = smem_tiled_copy_O.get_thread_slice(tidx);
     Tensor tOrO = smem_thr_copy_O.retile_S(acc_o);
     Tensor tOsO = smem_thr_copy_O.partition_D(sO);
