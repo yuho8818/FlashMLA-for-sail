@@ -407,7 +407,16 @@ struct KVCacheGmemFP8 {
 
 };
 
-template<int kBlockN, int kNThreads, int kHeadDim_, bool IsV41FP8_ = false>
+// V523-S23: Fp8VDirectK selects the fp8 K staging layout that
+// gemm_pv_fp8_vdirect indexes.  V-direct reads the tile as CUBE_H=64 rows x
+// CUBE_W=64 bf16 lanes (8192 B) with cube = (kv/64)*kVTilesPerRow + head/128,
+// which is the plain tile_to_shape((8,128), (kBlockN, kHeadDimV)) walk -- i.e.
+// no software Swizzle, the TSM hardware applies the swizzle itself.  The default
+// layout below (Swizzle<3,4,3>, 1024 B cubes) does not match that walk, so an
+// fp8-compute consumer that reads K through V-direct must opt in.  Consumers
+// that only dequantize to bf16 (the default) are unaffected.
+template<int kBlockN, int kNThreads, int kHeadDim_, bool IsV41FP8_ = false,
+         bool Fp8VDirectK_ = false>
 struct KVCacheG2SFP8 {
     using ElementKVCache = cutlass::float_e4m3_t;
     using Element = cutlass::bfloat16_t;
@@ -440,8 +449,14 @@ struct KVCacheG2SFP8 {
         make_layout(Shape<Int<kHeadDimV>, Int<kBlockN>>{}, GenRowMajor{})));
 
     // smem for G2S
-    using SmemLayoutAtomFP8 = decltype(composition(Swizzle<3, 4, 3>{},
+    static constexpr bool Fp8VDirectK = Fp8VDirectK_;
+    using SmemLayoutAtomFP8Swizzled = decltype(composition(Swizzle<3, 4, 3>{},
         Layout<Shape<_8, Int<128>>, Stride<Int<128>, _1>>{}));
+    // Plain 8x128 atom: same 128-byte row (so swzl_mode is unchanged at 0) but
+    // the tile walk V-direct indexes.  See the Fp8VDirectK note above.
+    using SmemLayoutAtomFP8Plain = Layout<Shape<_8, Int<128>>, Stride<Int<128>, _1>>;
+    using SmemLayoutAtomFP8 = std::conditional_t<Fp8VDirectK_,
+        SmemLayoutAtomFP8Plain, SmemLayoutAtomFP8Swizzled>;
     using SmemLayoutKNopeFP8 = decltype(tile_to_shape(SmemLayoutAtomFP8{}, Shape<Int<kBlockN>, Int<kHeadDimV>>{}));
     using SmemLayoutKNopeBF16 = decltype(tile_to_shape(SmemLayoutAtomK{}, Shape<Int<kBlockN>, Int<kHeadDimV>>{}));
     using SmemLayoutKRope = decltype(tile_to_shape(SmemLayoutAtomK{}, Shape<Int<kBlockN>, Int<kHeadDimRope>>{}));
@@ -579,6 +594,54 @@ struct KVCacheG2SFP8 {
         }
 
         cute::cp_async_fence();
+    }
+
+    // V523-S26: fp8-compute variant of cvt_fp8_store.  The V4.1 cache holds K
+    // as e4m3 plus a per-32-channel e8m0 scale, with
+    //     K_true = e4m3 * 2^(scale-127).
+    // The bf16 path applies that factor inside cvt_fp8_store.  The fp8 path
+    // used to skip the call entirely, which silently dropped the scale and fed
+    // raw e4m3 numbers to the QK^T MMA (measured lse 298 against a true 4.85).
+    // This variant applies the scale and writes E4M3 back, so the staged
+    // buffer stays consumable by the fp8 MMA and by V-direct.
+    template <typename Tensor0, typename Tensor2>
+    __forceinline__ __device__ void
+    scale_fp8_inplace(Tensor0& Tsr_fp8, Tensor2& scale) {
+        auto addr_fp8 = make_smem_ptr(reinterpret_cast<ElementKVCache*>(Tsr_fp8.data().get()));
+        Tensor sK_fp8 = make_tensor(addr_fp8, SmemLayoutKNopeFP8{});
+        Tensor tKsK_fp8 = s2r_tile_copy_K_nope.get_thread_slice(tidx).partition_D(sK_fp8);
+        Tensor tKrK_fp8 = make_fragment_like(tKsK_fp8);
+        Tensor tKsK_fp8_r = s2r_wide.get_thread_slice(tidx).partition_D(sK_fp8);
+        Tensor tKrK_fp8_w = make_fragment_like(tKsK_fp8_r);
+        constexpr int kWideTiles = size<2>(tKrK_fp8_w);
+        #pragma unroll
+        for (int w = kWideTiles - 1; w >= 0; --w) {
+            cute::copy(s2r_wide, tKsK_fp8_r(_, _, w), tKrK_fp8_w(_, _, w));
+        }
+        // per-32 scale: a thread's 16 dims sit inside one 32-region.
+        cute::for_each(make_seq<kWideTiles>{}, [&](auto tile) {
+            constexpr int w = kWideTiles - 1 - decltype(tile)::value;
+            const uint64_t scale_word = static_cast<uint64_t>(scale(Int<w / 2>{}));
+            const int scale_byte = (w % 2) * 4 + ((tidx % kSmemThreadsPerRowNope) / 2);
+            fp8_e8m0 scale_value;
+            scale_value.__x = static_cast<uint8_t>(scale_word >> (scale_byte * 8));
+            const float sf = float(scale_value);
+            auto packed_t = tKrK_fp8_w(_, _, w);
+            auto p32 = recast<uint32_t>(packed_t);
+            #pragma unroll
+            for (int m = 0; m < size(p32); ++m) {
+                const uint32_t packed = p32[m];
+                cutlass::float_e4m3_t e0; e0.storage = uint8_t(packed & 0xFF);
+                cutlass::float_e4m3_t e1; e1.storage = uint8_t((packed >> 8) & 0xFF);
+                cutlass::float_e4m3_t o0 = cutlass::float_e4m3_t::from_float(float(e0) * sf);
+                cutlass::float_e4m3_t o1 = cutlass::float_e4m3_t::from_float(float(e1) * sf);
+                p32[m] = uint32_t(o0.storage) | (uint32_t(o1.storage) << 8);
+            }
+        });
+        #pragma unroll
+        for (int w = kWideTiles - 1; w >= 0; --w) {
+            cute::copy(r2s_wide, tKrK_fp8_w(_, _, w), tKsK_fp8_r(_, _, w));
+        }
     }
 
     template <bool RegisterV41Scale = true, typename Tensor0, typename Tensor1, typename Tensor2>
