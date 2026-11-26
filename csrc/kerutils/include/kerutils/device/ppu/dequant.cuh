@@ -163,6 +163,38 @@ __device__ __forceinline__ void fp4x16_to_bf16(
     }
 }
 
+// V523-S50: E2M1 code -> float.  Every magnitude (0, .5, 1, 1.5, 2, 3, 4, 6)
+// is exact in bf16 (<= 2 mantissa bits), so widening the bf16 bit pattern to
+// f32 is lossless.
+__device__ __forceinline__ float fp4_e2m1_to_float(uint8_t code) {
+    return __uint_as_float(uint32_t(fp4_e2m1_to_bf16_bits(code)) << 16);
+}
+
+// V523-S50: E4M3 twin of fp4x16_to_bf16 for the fp8-compute arm.  The extra
+// FP4 pool must be staged as E4M3 (the QK^T MMA and V-direct both consume E4M3
+// out of the K staging), with the FP4 block scale folded into the E4M3 value
+// -- the same semantics the regular V41 blocks get from
+// KVCacheG2SFP8::scale_fp8_inplace.  Fragment element j of the 16-value tile
+// holds nibble j of `packed` (the packing fp4x16_to_bf16 relies on), so word m
+// of the recast fragment covers nibbles 4m..4m+3 = bits 16m..16m+15.
+template <typename Tensor0>
+__device__ __forceinline__ void fp4x16_to_e4m3(
+        uint64_t packed, Tensor0 dst, float scale) {
+    auto p32 = recast<uint32_t>(dst);
+    #pragma unroll
+    for (int m = 0; m < size(p32); ++m) {
+        const uint32_t nibs = uint32_t(packed >> (16 * m));
+        uint32_t out = 0;
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const float v = fp4_e2m1_to_float(uint8_t(nibs >> (4 * j)));
+            const cutlass::float_e4m3_t e = cutlass::float_e4m3_t::from_float(v * scale);
+            out |= uint32_t(e.storage) << (8 * j);
+        }
+        p32[m] = out;
+    }
+}
+
 template <typename ElementKVCache, int kBlockN, int kNThreads, int kHeadDim_ = 576, int kHeadDimV_ = 512>
 struct KVCacheGmemBf16 {
     using index_t = int64_t;
@@ -814,6 +846,52 @@ struct KVCacheG2SFP4 {
                 fp4x16_to_bf16<RegisterDecode>(packed[w], tKrK_bf16(_, _, w), float(scale_e4m3), lut);
                 cute::copy(r2s_wide, tKrK_bf16(_, _, w), tKsK_bf16(_, _, w));
             }
+        }
+    }
+
+    // V523-S50: fp8-compute variant of cvt_fp4_store.
+    //
+    // The bf16 cvt_fp4_store above is doubly wrong on the fp8 arm: (a) the
+    // QK^T MMA and V-direct read the K staging as E4M3, so bf16 bytes staged
+    // there are reinterpreted as e4m3; (b) the bf16 write needs
+    // kBlockN * 1024 B while the fp8 arm's staging buffer holds
+    // kBlockN * 512 B (Kernel_traits::SmemLayoutK over e4m3) -- a 2x overflow
+    // that clobbers the double-buffer partner and everything behind it.
+    // Every probe before V523-S50 passed extra=None, so this fp8
+    // IsExtraFP4 path never ran.
+    //
+    // This variant converts FP4 -> E4M3 with the block scale folded in (the
+    // FP4 pool carries one e4m3 scale per 16 dims; folding it keeps the same
+    // semantics KVCacheG2SFP8::scale_fp8_inplace gives the regular blocks)
+    // and writes through the E4M3 staging layout the fp8 readers expect, so
+    // the buffer footprint is 1x and extra blocks become byte-compatible
+    // with regular e4m3 blocks.
+    template <typename Tensor0>
+    __forceinline__ __device__ void
+    cvt_fp4_store_fp8(Tensor0& sK) {
+        auto sK_fp8 = make_tensor(
+            make_smem_ptr(reinterpret_cast<typename Base::ElementKVCache*>(sK.data().get())),
+            typename Base::SmemLayoutKNopeFP8{});
+        auto tKsK_fp8 = r2s_wide.get_thread_slice(tidx).partition_D(sK_fp8);
+        auto tKrK_fp8 = make_fragment_like(tKsK_fp8);
+        const uint64_t* sdata = reinterpret_cast<const uint64_t*>(sK.data().get());
+        const uint8_t* sscale = reinterpret_cast<const uint8_t*>(sK.data().get())
+            + kBlockN * kDataBytesPerToken;
+        const int lane_in_row = tidx % kThreadsPerRow;
+        const int token = tidx / kThreadsPerRow;
+        uint64_t packed[kWideTiles];
+        uint8_t scale_raw[kWideTiles];
+        #pragma unroll
+        for (int w = 0; w < kWideTiles; ++w) {
+            packed[w] = sdata[tidx * kWideTiles + w];
+            scale_raw[w] = sscale[token * kScalesPerToken + w * kThreadsPerRow + lane_in_row];
+        }
+        __syncthreads();  // staging read done before the in-place e4m3 write clobbers it
+        #pragma unroll
+        for (int w = 0; w < kWideTiles; ++w) {
+            __hg_fp8_e4m3 scale_e4m3 = *reinterpret_cast<const __hg_fp8_e4m3*>(&scale_raw[w]);
+            fp4x16_to_e4m3(packed[w], tKrK_fp8(_, _, w), float(scale_e4m3));
+            cute::copy(r2s_wide, tKrK_fp8(_, _, w), tKsK_fp8(_, _, w));
         }
     }
 };

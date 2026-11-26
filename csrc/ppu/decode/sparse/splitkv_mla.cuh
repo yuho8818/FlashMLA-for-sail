@@ -540,7 +540,17 @@ using SmemLayoutKActive = std::conditional_t<Kernel_traits::QKV_FP8,
                     kvload_gmem.template cvt_fp8_store<!IsExtraFP4 || RegisterFP4>(sK_cvt, sK_cvt, tKrScale);
                 }
             } else {
-                fp4load_gmem.cvt_fp4_store(sK_cvt);
+                // V523-S50: on the fp8 arm the extra FP4 pool must be staged
+                // as E4M3, not BF16 -- cvt_fp4_store writes bf16 through
+                // SmemLayoutKBF16, which the e4m3 readers misinterpret and
+                // which needs 2x the fp8 staging buffer.  Both extra-block
+                // consumers (QK^T MMA, V-direct) then read the extra blocks
+                // exactly like regular e4m3 blocks.
+                if constexpr (Kernel_traits::QKV_FP8) {
+                    fp4load_gmem.cvt_fp4_store_fp8(sK_cvt);
+                } else {
+                    fp4load_gmem.cvt_fp4_store(sK_cvt);
+                }
             }
         } else {
             // FP8 compute keeps the staged E4M3 in place: both GEMMs consume FP8
