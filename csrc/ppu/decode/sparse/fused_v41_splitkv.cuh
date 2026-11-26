@@ -729,7 +729,20 @@ __forceinline__ __device__ void store_output(
     // which is how the dense fp8 path stores O too.  An earlier revision also
     // swapped in TiledMmaSPStore here, double-applying the permutation -- that
     // atom is for the pi_k sP store, not for O (see kernel_traits.h).
-    typename KT::TiledMma tiled_mma;
+    //
+    // V523-S50 FIX (defect D2): the "natural" claim above is wrong.  After
+    // permute_output_fp8 the accumulator is in EpiPerm order, and only
+    // TiledMmaStoreEpiO's CLayout maps that back to natural sO columns -- the
+    // scheme flash::store uses for BOTH its split and no-split outlets
+    // (csrc/utils.h, the hardware-validated fp8 path).  With the natural
+    // TiledMma every no_split query stored a column-permuted O: measured on
+    // s50fix1, n_q >= 22 (the tile-scheduler threshold where a partition owns
+    // a whole query) gives O uncorrelated with the bf16 arm (~93-106% mean
+    // relative error, per-row cosine 0.24) while lse agrees to 2e-4; n_q <= 21
+    // (split path, flash::store) stays at 2%.
+    using TiledMmaOStore = std::conditional_t<kPvFp8<KT>,
+        typename KT::TiledMmaStoreEpiO, typename KT::TiledMma>;
+    TiledMmaOStore tiled_mma;
     auto smem_tiled_copy_O = make_tiled_copy_C(typename KT::SmemCopyAtomOaccum{}, tiled_mma);
     auto smem_thr_copy_O = smem_tiled_copy_O.get_thread_slice(tidx);
     Tensor tOrO = smem_thr_copy_O.retile_S(acc_o);
