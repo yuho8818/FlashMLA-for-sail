@@ -180,6 +180,15 @@ __forceinline__ __device__ int native_offset(int row, int dim) {
     }
 }
 
+// Row-count overload: main's prefill/WI/HS64 fused callers address the BF16
+// staging layout by row count (native_offset<kBlockM>), predating the fp8
+// split. Keep that name and signature for them -- their contexts are BF16-only
+// -- while the KT dispatcher above serves the fp8-aware decode path.
+template<int Rows>
+__forceinline__ __device__ int native_offset(int row, int dim) {
+    return native_offset_bf16<Rows>(row, dim);
+}
+
 template<typename KT, bool ExtraFP4>
 __forceinline__ __device__ float* scratch(char* smem) {
     return reinterpret_cast<float*>(smem + scratch_offset<KT, ExtraFP4>());
