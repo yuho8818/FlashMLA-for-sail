@@ -754,11 +754,13 @@ def main() -> int:
     trivial = sum(1 for _, reg, c, m in rows
                   if reg == "E-region" and c["sink_mode"] == "inf"
                   and m["fp8_error"] is None and m["arm_ok"])
-    e_fail = e_t - e_p
-    e_numeric = e_fail - trivial
+    # The degenerate cell is one of the PASSes, so e_fail already excludes it --
+    # subtracting ``trivial`` again would undercount the numeric failures by one
+    # (caught by the V523-S52 adversarial review).
+    e_numeric = e_t - e_p
     print()
     print(f"  E-region breakdown: {e_t} judged cells = {e_p} PASS "
-          f"({trivial} of them the degenerate all-inf-sink cell) "
+          f"(incl. {trivial} degenerate all-inf-sink cell) "
           f"+ {e_numeric} numeric FAIL; {e_crash} CRASH excluded")
     if e_numeric > 0:
         print(f"  DEPLOYMENT SHAPE REPRODUCES A DIVERGENCE: {e_numeric} E-region cells")
