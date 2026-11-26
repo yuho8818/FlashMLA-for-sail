@@ -2,7 +2,7 @@
 
 #include "decode/sparse/sparse_decode_wg.cuh"
 #include "sparse/fused_v41_wi.cuh"
-#include "decode/sparse/fused_v41_splitkv.cuh"
+#include "ppuxx/decode/combine/fused_v41.h"
 
 namespace flashmla::fused_norm_rope_attn_rope_cast_fwd::core_attn {
 
@@ -170,7 +170,9 @@ bool run_fused_norm_rope_attn_rope_cast_decode_native_wi_impl(
     flashmla::dsa::v41::launch_sparse_decode_wg_v41_main<T>(p, params.stream);
 
     combine::Params c{};
+    c.arch = params.arch;
     c.per_token_scale = PerTokenScale;
+    c.output_format = params.output_format;
     c.s_q = params.s_q;
     c.h_q = 128;
     c.num_sm_parts = split.num_sm_parts;
@@ -201,14 +203,10 @@ bool run_fused_norm_rope_attn_rope_cast_decode_native_wi(
 }
 
 template void run_fused_norm_rope_attn_rope_cast_fwd_kernel<FwdMode::Decode, 128, false, false>(const Params&);
-template void run_fused_norm_rope_attn_rope_cast_decode_splitkv_kernel<128, false, false>(const Params&, const SplitKVParams&);
 template void run_fused_norm_rope_attn_rope_cast_fwd_kernel<FwdMode::Decode, 128, true, false>(const Params&);
-template void run_fused_norm_rope_attn_rope_cast_decode_splitkv_kernel<128, true, false>(const Params&, const SplitKVParams&);
 template void run_fused_norm_rope_attn_rope_cast_fwd_kernel<FwdMode::Decode, 128, false, true>(const Params&);
 template bool run_fused_norm_rope_attn_rope_cast_decode_native_wi<false>(const Params&, const SplitKVParams&);
-template void run_fused_norm_rope_attn_rope_cast_decode_splitkv_kernel<128, false, true>(const Params&, const SplitKVParams&);
 template void run_fused_norm_rope_attn_rope_cast_fwd_kernel<FwdMode::Decode, 128, true, true>(const Params&);
 template bool run_fused_norm_rope_attn_rope_cast_decode_native_wi<true>(const Params&, const SplitKVParams&);
-template void run_fused_norm_rope_attn_rope_cast_decode_splitkv_kernel<128, true, true>(const Params&, const SplitKVParams&);
 
 } // namespace flashmla::fused_norm_rope_attn_rope_cast_fwd::core_attn

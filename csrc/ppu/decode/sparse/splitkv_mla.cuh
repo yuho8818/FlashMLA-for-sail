@@ -42,7 +42,8 @@ template<typename P>
 struct is_fused_splitkv_norm<P, std::void_t<decltype(P::kEnableNorm)>>
     : std::bool_constant<is_fused_splitkv<P>::value && P::kEnableNorm> {};
 
-template<typename Kernel_traits, bool IsV41FP8, bool IsExtraFP4, bool CheckKvCapacity = false, typename Params>
+template<typename Kernel_traits, bool IsV41FP8, bool IsExtraFP4, bool CheckKvCapacity = false,
+         bool AbsoluteSplitIndex = false, bool FloatKV = kDefaultV41FloatKv, typename Params>
 __forceinline__ __device__ void compute_attn_fp8_sparse_splitkv(
     const Params &params, const int batch_id, const int bidh, const int m_block,
     const int n_split_idx, const int n_block_min, const int n_block_max, const bool NoSplit,
@@ -84,7 +85,7 @@ __forceinline__ __device__ void compute_attn_fp8_sparse_splitkv(
         fp4_lut = reinterpret_cast<uint32_t*>(
             smem_ + Kernel_traits::kSmemSizeAccum + kBlockN * 2 * sizeof(int));
         for (int i = tidx; i < KVCacheGmemFP4::kLutEntries; i += Kernel_traits::kNThreads) {
-            fp4_lut[i] = fp4_pair_to_bf16x2_bits(uint8_t(i / KVCacheGmemFP4::kLutReplicas));
+            fp4_lut[i] = fp4_pair_to_bf16x2_bits<FloatKV>(uint8_t(i / KVCacheGmemFP4::kLutReplicas));
         }
         __syncthreads();
     }
@@ -537,7 +538,8 @@ using SmemLayoutKActive = std::conditional_t<Kernel_traits::QKV_FP8,
                     // and dropping the scale made every score ~60x too large.
                     kvload_gmem.template scale_fp8_inplace(sK_cvt, tKrScale);
                 } else {
-                    kvload_gmem.template cvt_fp8_store<!IsExtraFP4 || RegisterFP4>(sK_cvt, sK_cvt, tKrScale);
+                    kvload_gmem.template cvt_fp8_store<!IsExtraFP4 || RegisterFP4, FloatKV>(
+                        sK_cvt, sK_cvt, tKrScale);
                 }
             } else {
                 // V523-S50: on the fp8 arm the extra FP4 pool must be staged
@@ -549,7 +551,7 @@ using SmemLayoutKActive = std::conditional_t<Kernel_traits::QKV_FP8,
                 if constexpr (Kernel_traits::QKV_FP8) {
                     fp4load_gmem.cvt_fp4_store_fp8(sK_cvt);
                 } else {
-                    fp4load_gmem.cvt_fp4_store(sK_cvt);
+                    fp4load_gmem.template cvt_fp4_store<FloatKV && kFusedSplitKV && kBlockM == 64, FloatKV>(sK_cvt);
                 }
             }
         } else {
@@ -561,7 +563,8 @@ using SmemLayoutKActive = std::conditional_t<Kernel_traits::QKV_FP8,
             if constexpr (Kernel_traits::QKV_FP8) {
                 kvload_gmem.template scale_fp8_inplace(sK_cvt, tKrScale);
             } else {
-                kvload_gmem.template cvt_fp8_store<!IsExtraFP4 || RegisterFP4>(sK_cvt, sK_cvt, tKrScale);
+                kvload_gmem.template cvt_fp8_store<!IsExtraFP4 || RegisterFP4, FloatKV>(
+                    sK_cvt, sK_cvt, tKrScale);
             }
         }
         __syncthreads();
@@ -695,7 +698,7 @@ using SmemLayoutKActive = std::conditional_t<Kernel_traits::QKV_FP8,
             flash::store<Kernel_traits, false, true, true>(params, batch_id, bidh, m_block, n_split_idx, smem_, acc_o, softmax);
         }
     } else {
-        flash::store<Kernel_traits, true, true, true, kFusedSplitKV>(params, batch_id, bidh, m_block, n_split_idx, smem_, acc_o, softmax);
+        flash::store<Kernel_traits, true, true, true, kFusedSplitKV, AbsoluteSplitIndex>(params, batch_id, bidh, m_block, n_split_idx, smem_, acc_o, softmax);
     }
 }
 
@@ -1132,7 +1135,8 @@ __forceinline__ __device__ void compute_attn_bf16_sparse_splitkv(
 }
 
 template<typename Kernel_traits, bool IsFP8 = false, bool IsV41FP8 = false,
-         bool IsExtraFP4 = false, int MetadataBlockN = Kernel_traits::kBlockN>
+         bool IsExtraFP4 = false, int MetadataBlockN = Kernel_traits::kBlockN,
+         bool FloatKV = kDefaultV41FloatKv>
 __global__ void __launch_bounds__(Kernel_traits::kNThreads, 1, 1)
 flash_sparse_decode_fwd_kernel(__grid_constant__ const Flash_fwd_params params) {
     constexpr int kBlockN = Kernel_traits::kBlockN;
@@ -1185,7 +1189,7 @@ flash_sparse_decode_fwd_kernel(__grid_constant__ const Flash_fwd_params params) 
             int ori_block_max = cute::ceil_div(seqlen_kpad, kBlockN);
 
             if constexpr (IsFP8) {
-                compute_attn_fp8_sparse_splitkv<Kernel_traits, IsV41FP8, IsExtraFP4>(
+                compute_attn_fp8_sparse_splitkv<Kernel_traits, IsV41FP8, IsExtraFP4, false, false, FloatKV>(
                     params, batch_id, bidh, m_block, n_split_idx,
                     n_block_min, n_block_max, NoSplit, seqlen_k,
                     ori_block_max, extra_seqlen_k);
@@ -1206,7 +1210,7 @@ flash_sparse_decode_fwd_kernel(__grid_constant__ const Flash_fwd_params params) 
             bool NoSplit = n_block_min == 0 && n_block_max == ori_block_max;
 
             if constexpr (IsFP8) {
-                compute_attn_fp8_sparse_splitkv<Kernel_traits, IsV41FP8, IsExtraFP4>(
+                compute_attn_fp8_sparse_splitkv<Kernel_traits, IsV41FP8, IsExtraFP4, false, false, FloatKV>(
                     params, batch_id, bidh, m_block, n_split_idx,
                     n_block_min, n_block_max, NoSplit, seqlen_k,
                     ori_block_max, 0);
@@ -1236,6 +1240,12 @@ void run_flash_sparse_decode_fwd(Flash_fwd_params &params, hggcStream_t stream) 
     const int num_m_block = (params.seqlen_q / params.ngroups) * cute::ceil_div(params.ngroups, Kernel_traits::kBlockM);
 
         auto kernel = &flash::flash_sparse_decode_fwd_kernel<Kernel_traits, IsFP8, IsV41FP8, IsExtraFP4, MetadataBlockN>;
+        if constexpr (IsFP8) {
+            if (params.v41_float_kv != kDefaultV41FloatKv) {
+                kernel = &flash::flash_sparse_decode_fwd_kernel<
+                    Kernel_traits, IsFP8, IsV41FP8, IsExtraFP4, MetadataBlockN, !kDefaultV41FloatKv>;
+            }
+        }
         flash::printf_show_log<Kernel_traits>(reinterpret_cast<const void*>(kernel), params, smem_size, false, true, IsFP8);
         //CHECK_CUDA(hggcFuncSetAttribute(kernel, hggcFuncAttributeMaxDynamicSharedMemorySize, smem_size));
         if (smem_size >= 48 * 1024) {

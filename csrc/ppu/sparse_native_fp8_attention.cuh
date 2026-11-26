@@ -2,6 +2,68 @@
 
 #include <hggc_runtime.h>
 
+#include <algorithm>
+#include <cstdint>
+
+namespace flashmla::sparse_native_fp8 {
+
+inline constexpr int ValueDim = 512;
+inline constexpr int TileKeys = 64;
+inline constexpr int MaxTopk = 2048;
+inline constexpr int MaxVerifyQueries = 32;
+
+// Measured M890P reuse crossover for sparse FP8 gathers. This is a launch
+// policy budget, not a claim about physical cache capacity. Pools below it
+// benefit from narrower gathers and more resident CTAs; streaming pools favor
+// wider transactions and fewer competing CTAs.
+inline bool prefer_kv_reuse(int64_t working_bytes, int l2_bytes) {
+    constexpr int ReuseBudgetL2Multiple = 16;
+    return l2_bytes > 0 && working_bytes <= int64_t(l2_bytes) * ReuseBudgetL2Multiple;
+}
+
+// Keep at least four key tiles per partition while exposing roughly two
+// query/head CTAs per CU. Power-of-two splits bound the merge overhead.
+inline int choose_splits(int queries, int heads, int width, int compute_units) {
+    constexpr int MaxSplits = 8;
+    constexpr int MinTilesPerSplit = 4;
+    const int head_tile = heads <= 16 ? 16 : 32;
+    const int groups = (heads + head_tile - 1) / head_tile;
+    const int budget = std::min(MaxSplits, std::max(1, width / TileKeys / MinTilesPerSplit));
+    const int desired = std::min<int64_t>(
+        budget, std::max<int64_t>(1, 2LL * compute_units / (int64_t(queries) * groups)));
+    int splits = 1;
+    while (splits * 2 <= desired)
+        splits *= 2;
+    return splits;
+}
+
+// Full-Q H16 pipelines amortize short sparse lists without the older decode
+// schedule's partial-Q loads. Small grids still need independent key partitions:
+// use one N128 tile at very low occupancy, then four N64 pipeline partitions.
+inline int choose_short_h16_splits(int queries, int width, int compute_units) {
+    constexpr int MinSplitTiles = 8;
+    constexpr int PipelineSplits = 4;
+    if (width < MinSplitTiles * TileKeys || int64_t(queries) * 2 > compute_units)
+        return 1;
+    if (int64_t(queries) * 8 <= compute_units)
+        return (width + 2 * TileKeys - 1) / (2 * TileKeys);
+    return PipelineSplits;
+}
+
+// Small head tiles fit three double-buffered or two triple-buffered CTAs per
+// M890P CU. Compare complete waves using their measured relative tile costs.
+inline bool prefer_two_stages(int queries, int splits, int heads, int compute_units) {
+    const int64_t tasks = int64_t(queries) * splits;
+    const int64_t two_stage_wave = 3LL * compute_units;
+    const int64_t three_stage_wave = 2LL * compute_units;
+    constexpr int TwoStageCost = 10;
+    constexpr int ThreeStageCost = 8;
+    return heads <= 16 && ((tasks + two_stage_wave - 1) / two_stage_wave) * TwoStageCost <=
+                              ((tasks + three_stage_wave - 1) / three_stage_wave) * ThreeStageCost;
+}
+
+} // namespace flashmla::sparse_native_fp8
+
 namespace flashmla::sparse_native_fp8 {
 
 // One prepared request is passed through host routing to the final device launch.
@@ -73,15 +135,20 @@ void run_native_fp8_attention_verify(const flashmla::sparse_native_fp8::Attentio
 void run_native_fp8_attention_window(const flashmla::sparse_native_fp8::AttentionParams &params);
 void run_native_fp8_attention_merge(const flashmla::sparse_native_fp8::MergeParams &params);
 
-// Host C++ includes only launch contracts. Device implementation and the
+// Host C++ includes launch contracts and policy. Device implementation and the
 // actlize version override belong to HGGC translation units only.
 #ifdef __HGGCCC__
 
 // Shared native FP8 sparse attention for prefill, decode and verification:
 // E4M3 conversion, LSE storage, standard CTA kernels and WS pipeline components.
 
-#include "ppu/sparse_native_fp8_arch.h"
-#include "sparse_native_fp8_config.h"
+// Select native PPU0015 definitions before including any actlize headers.
+// This override is local to native FP8 translation units; existing kernels
+// retain the build's ACOMPUTE_VERSION=10000 configuration.
+#ifdef ACOMPUTE_VERSION
+#undef ACOMPUTE_VERSION
+#endif
+#define ACOMPUTE_VERSION 10500
 #include <hgrt/hggc_extend_device_functions.h>
 #include <hggc_bf16.h>
 #include <hggc_fp8.h>
@@ -401,7 +468,8 @@ __global__ __launch_bounds__(Fp8SparsePrefillTraits<BM, DenseThreads, BlockN>::T
     const float *__restrict__ gAttnSink, const int *__restrict__ gTopkLength,
     const int *request_errors, int lse_queries = 0, const E4M3 *extra_kv = nullptr,
     const int *extra_ids = nullptr, const int *extra_lengths = nullptr,
-    int primary_width = 0, int primary_rows = 0, int request_queries = 1) {
+    int primary_width = 0, int primary_rows = 0, int request_queries = 1,
+    int gather_cache_rows = 0) {
     using Traits = Fp8SparsePrefillTraits<BM, DenseThreads, BlockN>;
     constexpr int BN = BlockN;
     constexpr bool SingleTile = BlockN == 128;
@@ -555,25 +623,45 @@ __global__ __launch_bounds__(Fp8SparsePrefillTraits<BM, DenseThreads, BlockN>::T
     }
     __syncthreads();
 
-    // Per-thread gather offsets are tile-invariant: compute the swizzled
-    // destinations once instead of re-deriving the XOR on every granule.
-    // Gather whole 16-byte granules cooperatively; wider groups amortize
-    // sparse row lookups when the grid has enough parallel work.
-    static constexpr int GATHER_LANES = GatherLanes;
-    static constexpr int GATHER_ROWS = NTHR / GATHER_LANES;
-    static constexpr int GATHER_REPEATS = BN / GATHER_ROWS;
-    static constexpr int GATHER_WIDTH = GATHER_LANES * 16;
-    static constexpr int KSEGS = (DQK + GATHER_WIDTH - 1) / GATHER_WIDTH;
-    const int grow = tid / GATHER_LANES, glane = tid % GATHER_LANES, col0 = glane * 16;
-    // Both gather widths are multiples of the 64-byte cube width.
-    // Keep one lane offset; later cubes add a constant physical stride.
-    int gather_offsets[GATHER_REPEATS];
-    CUTE_UNROLL
-    for (int r = 0; r < GATHER_REPEATS; ++r)
-        gather_offsets[r] = (int)(reinterpret_cast<const uint8_t *>(
-            &sKt0(grow + r * GATHER_ROWS, col0)) - reinterpret_cast<const uint8_t *>(pK));
+    bool wide_gather = false;
+    if constexpr (GatherLanes == 0) {
+        static_assert(BM == 64 && NTHR == 256 && BN == 64 && !Dual);
+        if (wp == 0) {
+            const int slot = lane * max(0, topk_length - 1) / 31;
+            const int token = topk_length > 0 ? sIdx[slot] : -1;
+            const bool valid = (unsigned)token < (unsigned)s_kv;
+            int low = valid ? token : s_kv, high = valid ? token : 0;
+            bool repeated = false;
+            if (q_token > 0) {
+                const int previous_length = gTopkLength
+                    ? max(0, min(n_tiles * BN, gTopkLength[q_token - 1])) : n_tiles * BN;
+                repeated = slot < previous_length && token == gIdx[slot - n_tiles * BN];
+            }
+            const bool shared_history = __all_sync(0xffffffff, repeated);
+            CUTE_UNROLL
+            for (int offset = 16; offset > 0; offset >>= 1) {
+                low = min(low, __shfl_xor_sync(0xffffffff, low, offset));
+                high = max(high, __shfl_xor_sync(0xffffffff, high, offset));
+            }
+            if (lane == 0)
+                *sFlag = !shared_history && gather_cache_rows > 0 && high - low > gather_cache_rows;
+        }
+        __syncthreads();
+        wide_gather = *sFlag;
+    }
 
-    auto issue_K = [&](int t) {
+    auto gather_K = [&](auto lanes, int t) {
+        constexpr int GATHER_LANES = decltype(lanes)::value;
+        constexpr int GATHER_ROWS = NTHR / GATHER_LANES;
+        constexpr int GATHER_REPEATS = BN / GATHER_ROWS;
+        constexpr int GATHER_WIDTH = GATHER_LANES * 16;
+        constexpr int KSEGS = (DQK + GATHER_WIDTH - 1) / GATHER_WIDTH;
+        const int grow = tid / GATHER_LANES, col0 = (tid % GATHER_LANES) * 16;
+        int gather_offsets[GATHER_REPEATS];
+        CUTE_UNROLL
+        for (int r = 0; r < GATHER_REPEATS; ++r)
+            gather_offsets[r] = (int)(reinterpret_cast<const uint8_t *>(
+                &sKt0(grow + r * GATHER_ROWS, col0)) - reinterpret_cast<const uint8_t *>(pK));
         uint8_t *kdst = reinterpret_cast<uint8_t *>(pK + (t & 1) * KTILE);
         CUTE_UNROLL
         for (int r = 0; r < GATHER_REPEATS; ++r) {
@@ -621,6 +709,16 @@ __global__ __launch_bounds__(Fp8SparsePrefillTraits<BM, DenseThreads, BlockN>::T
                             *reinterpret_cast<cute::uint128_t *>(kdst + kdst0 + j * GATHER_WIDTH * BN),
                             ok);
             }
+        }
+    };
+    auto issue_K = [&](int t) {
+        if constexpr (GatherLanes == 0) {
+            if (wide_gather)
+                gather_K(Int<8>{}, t);
+            else
+                gather_K(Int<4>{}, t);
+        } else {
+            gather_K(Int<GatherLanes>{}, t);
         }
     };
     // PV reads the same swizzled KV stage as QK for both head tiles.
@@ -818,7 +916,8 @@ void launch(const flashmla::sparse_native_fp8::AttentionParams &params) {
         params.q, static_cast<const E4M3 *>(params.kv), params.idx,
         static_cast<cutlass::bfloat16_t *>(params.out), params.scale, (params.width / 64),
         params.kvrows, params.os, params.heads, params.maxima, params.lse, params.sink,
-        params.lengths, nullptr, params.lse_queries, nullptr, nullptr, nullptr, 0, 0, 1);
+        params.lengths, nullptr, params.lse_queries, nullptr, nullptr, nullptr, 0, 0, 1,
+        GatherLanes == 0 ? int(int64_t(params.cache_bytes) * 4 / D) : 0);
 }
 template <int Threads, int Prefix = 0, int GatherLanes = 8, bool GuardGatherReuse = false>
 void dispatch(const flashmla::sparse_native_fp8::AttentionParams &params) {

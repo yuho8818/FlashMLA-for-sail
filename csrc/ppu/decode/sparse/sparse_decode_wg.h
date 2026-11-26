@@ -52,25 +52,33 @@ inline bool sparse_decode_hs64_cache_range_supported(
 
 inline bool sparse_decode_hs64_addressing_supported(const Flash_fwd_params &p) {
     constexpr int64_t kMaxQueryStride = (int64_t{1} << 31) - 1;
-    return p.indices_row_stride >= 0 && p.indices_row_stride <= kMaxQueryStride &&
-           sparse_decode_hs64_cache_range_supported(
-               p.num_blocks, p.page_block_size, p.d, p.k_batch_stride) &&
+    return p.num_blocks > 0 && p.page_block_size > 0 && p.k_batch_stride >= 0 &&
+           p.indices_row_stride >= 0 && p.indices_row_stride <= kMaxQueryStride &&
            (p.extra_topk < 0 ||
-            (p.extra_indices_row_stride >= 0 &&
-             p.extra_indices_row_stride <= kMaxQueryStride &&
-             sparse_decode_hs64_cache_range_supported(
-                 p.extra_num_blocks, p.extra_page_block_size, p.d,
-                 p.extra_k_batch_stride)));
+            (p.extra_num_blocks > 0 && p.extra_page_block_size > 0 &&
+             p.extra_k_batch_stride >= 0 && p.extra_indices_row_stride >= 0 &&
+             p.extra_indices_row_stride <= kMaxQueryStride));
 }
+
+inline bool sparse_decode_hs64_kv_offsets_fit_u32(const Flash_fwd_params &p) {
+    return sparse_decode_hs64_cache_range_supported(
+               p.num_blocks, p.page_block_size, p.d, p.k_batch_stride) &&
+           (p.extra_topk < 0 || sparse_decode_hs64_cache_range_supported(
+               p.extra_num_blocks, p.extra_page_block_size, p.d,
+               p.extra_k_batch_stride));
+}
+
+// Narrow non-packed offsets use row-aligned units; packed offsets retain 8/4-byte units.
+constexpr int kHs64V41Fp8RowUnitBytes = 16;
+constexpr int kHs64V41Fp4RowUnitBytes = 32;
 
 inline bool sparse_decode_hs64_v41_cache_range_supported(
         int num_blocks, int page_size, int data_bytes_per_token,
         int address_unit_bytes, Flash_fwd_params::index_t page_stride_bytes) {
     if (num_blocks <= 0 || page_size <= 0 || page_stride_bytes < 0 ||
         address_unit_bytes <= 0 || page_stride_bytes % address_unit_bytes != 0) return false;
-    // The two copy waves exchange uint32 offsets measured in 8-byte FP8 or
-    // 4-byte FP4 units. Avoid truncating a page offset before the lane adds
-    // its within-token address.
+    // The two copy waves exchange uint32 offsets measured in address_unit_bytes.
+    // Avoid truncating a page offset before the lane adds its within-token address.
     const uint64_t limit = (uint64_t{1} << 32) * address_unit_bytes;
     const uint64_t row_bytes = uint64_t(page_size) * data_bytes_per_token;
     return row_bytes <= limit &&
@@ -84,17 +92,27 @@ inline bool sparse_decode_hs64_v41_supported(
     constexpr int64_t max_index_stride = std::numeric_limits<int>::max();
     // The API already validates D512/Hkv1 for V4.1.
     return p.ngroups == 64 && p.q_orig > 0 && p.num_sm_parts > 0 &&
-           pow2(p.page_block_size) &&
+           p.num_blocks > 0 && pow2(p.page_block_size) &&
+           p.k_batch_stride >= 0 && p.k_batch_stride % 8 == 0 &&
            p.indices_row_stride >= 0 && p.indices_row_stride <= max_index_stride &&
-           sparse_decode_hs64_v41_cache_range_supported(
-               p.num_blocks, p.page_block_size, 528, 8, p.k_batch_stride) &&
            (p.extra_topk < 0 ||
-            (pow2(p.extra_page_block_size) &&
-             p.extra_indices_row_stride >= 0 && p.extra_indices_row_stride <= max_index_stride &&
-             sparse_decode_hs64_v41_cache_range_supported(
-                p.extra_num_blocks, p.extra_page_block_size,
-                extra_fp4 ? 288 : 528, extra_fp4 ? 4 : 8,
-                p.extra_k_batch_stride)));
+            (p.extra_num_blocks > 0 && pow2(p.extra_page_block_size) &&
+             p.extra_k_batch_stride >= 0 &&
+             p.extra_k_batch_stride % (extra_fp4 ? 4 : 8) == 0 &&
+             p.extra_indices_row_stride >= 0 && p.extra_indices_row_stride <= max_index_stride));
+}
+
+template<bool Packed>
+inline bool sparse_decode_hs64_v41_kv_offsets_fit_u32(
+        const Flash_fwd_params &p, bool extra_fp4) {
+    constexpr int fp8_unit = Packed ? 8 : kHs64V41Fp8RowUnitBytes;
+    constexpr int fp4_unit = Packed ? 4 : kHs64V41Fp4RowUnitBytes;
+    return sparse_decode_hs64_v41_cache_range_supported(
+               p.num_blocks, p.page_block_size, 528, fp8_unit, p.k_batch_stride) &&
+           (p.extra_topk < 0 || sparse_decode_hs64_v41_cache_range_supported(
+               p.extra_num_blocks, p.extra_page_block_size,
+               extra_fp4 ? 288 : 528, extra_fp4 ? fp4_unit : fp8_unit,
+               p.extra_k_batch_stride));
 }
 
 inline bool sparse_decode_m128_index_tiles_supported(const Flash_fwd_params &p) {

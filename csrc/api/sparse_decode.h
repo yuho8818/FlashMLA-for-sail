@@ -53,7 +53,28 @@ static int v41_h8_direct_parts(const Flash_fwd_params &p) {
 
 namespace flashmla::dsa::hs64 {
 bool supports_v41_packed_flat_mtp(const Flash_fwd_params &, int extra_bytes);
-void run_v41_packed_page_decode(Flash_fwd_params &, hggcStream_t);
+void run_v41_packed_page_decode(Flash_fwd_params &, hggcStream_t, bool sm80);
+void run_legacy_int8_decode(Flash_fwd_params &, hggcStream_t);
+}
+
+static bool use_sm80_legacy_int8_hs64(const Flash_fwd_params &p) {
+    constexpr int kLegacyInt8PageSize = 64;
+    const auto *device = at::cuda::getCurrentDeviceProperties();
+    const bool fixed_case = p.b == 64 && p.topk == 640;
+    const int cache_bytes = p.d == 576 ? 656 : 584;
+    const auto aligned = [](const void *ptr) {
+        return (reinterpret_cast<uintptr_t>(ptr) & 15u) == 0;
+    };
+    return device->major == 8 && device->minor == 0 && fixed_case &&
+        p.q_orig == 1 && p.ngroups == 64 && p.h == 1 && p.seqlen_q == 64 &&
+        (p.d == 512 || p.d == 576) && p.d_v == 512 &&
+        p.extra_topk < 0 && !p.topk_len_ptr && !p.attn_sink_ptr && p.num_sm_parts > 0 &&
+        p.page_block_size == kLegacyInt8PageSize && p.num_blocks > 0 &&
+        p.k_batch_stride == kLegacyInt8PageSize * cache_bytes &&
+        uint64_t(p.num_blocks) * p.k_batch_stride <= std::numeric_limits<uint32_t>::max() &&
+        p.q_row_stride == p.d && p.q_batch_stride == 64 * p.d &&
+        p.o_row_stride == p.d_v && p.o_batch_stride == 64 * p.d_v &&
+        aligned(p.q_ptr) && aligned(p.k_ptr) && aligned(p.o_ptr);
 }
 
 template<bool ExtraFP4 = true>
@@ -62,6 +83,7 @@ static bool use_v41_packed_h64(const Flash_fwd_params &p) {
     const bool fixed_window = p.topk == 128 && p.page_block_size == 128;
     const bool ragged_window = p.topk == 256 && p.page_block_size == 256;
     if ((!fixed_window && !ragged_window) || p.ngroups != 64 || p.h != 1 ||
+        p.num_blocks <= 0 || p.extra_num_blocks <= 0 ||
         p.d != 512 || p.d_v != 512 || p.extra_topk != 512 || p.extra_page_block_size != 64 ||
         p.k_batch_stride != p.page_block_size * 528 || p.extra_k_batch_stride != 64 * extra_bytes ||
         p.b <= 0 || p.b > 65535 || p.num_sm_parts <= 0)
@@ -73,15 +95,16 @@ static bool use_v41_packed_h64(const Flash_fwd_params &p) {
         p.q_batch_stride <= 0 || p.q_batch_stride % 8 != 0 ||
         p.q_row_stride < p.d || p.q_row_stride > max_stride || p.q_row_stride % 8 != 0 ||
         p.indices_batch_stride < 0 || p.indices_row_stride < 0 || p.indices_row_stride > max_stride ||
-        p.extra_indices_batch_stride < 0 || p.extra_indices_row_stride < 0 || p.extra_indices_row_stride > max_stride ||
-        !flashmla::dsa::sparse_decode_hs64_v41_cache_range_supported(
-            p.num_blocks, p.page_block_size, 528, 8, p.k_batch_stride) ||
-        !flashmla::dsa::sparse_decode_hs64_v41_cache_range_supported(
-            p.extra_num_blocks, p.extra_page_block_size, extra_bytes,
-            ExtraFP4 ? 4 : 8, p.extra_k_batch_stride))
+        p.extra_indices_batch_stride < 0 || p.extra_indices_row_stride < 0 || p.extra_indices_row_stride > max_stride)
         return false;
 
     const auto *device = at::cuda::getCurrentDeviceProperties();
+    if (device->major == 8 && device->minor == 0) {
+        return ExtraFP4 && fixed_window && p.q_orig == 1 && p.b >= 40 &&
+               !p.topk_len_ptr && !p.extra_topk_len_ptr &&
+               p.o_batch_stride > 0 && p.o_batch_stride % 8 == 0 &&
+               p.o_row_stride >= p.d_v && p.o_row_stride <= max_stride && p.o_row_stride % 8 == 0;
+    }
     const int sm_count = device->multiProcessorCount;
     if (device->major != 8 || device->minor != 9 || sm_count != 39) return false;
     if constexpr (ExtraFP4) {
@@ -118,7 +141,8 @@ static bool use_v41_packed_fp8_extra_h64(const Flash_fwd_params &p) {
            affine(p.extra_indices_batch_stride, p.extra_indices_row_stride, sq);
 }
 
-static std::tuple<at::Tensor, at::Tensor, std::optional<at::Tensor>, std::optional<at::Tensor>>
+static std::tuple<at::Tensor, at::Tensor, std::optional<at::Tensor>, std::optional<at::Tensor>,
+                  std::optional<at::Tensor>, std::optional<at::Tensor>>
 sparse_attn_decode_interface(
     at::Tensor &q,                               // batch_size x seqlen_q_ori x num_heads_ori x head_size
     const at::Tensor &kv,                        // num_blocks x page_block_size x num_heads_k x head_size
@@ -133,7 +157,15 @@ sparse_attn_decode_interface(
     const std::optional<at::Tensor> &extra_topk_length,   // batch_size
     const float softmax_scale,
     const std::optional<at::Tensor> &out_,                // batch_size x seqlen_q_ori x num_heads_ori x head_size_v
-    const bool enable_batch_invariant
+    const bool enable_batch_invariant,
+    // HS64-specific scheduler cache, carried on the Python-side
+    // FlashMLASchedMeta object alongside tile_scheduler_metadata/num_splits.
+    // In:  the tensors produced by a previous call sharing this scheduler
+    //      object (std::nullopt on the first layer).
+    // Out: the 128-token HS64 schedule and its num_splits, so the next layer
+    //      reuses them instead of recomputing (see the HS64 branch below).
+    std::optional<at::Tensor> &hs64_tile_scheduler_metadata,
+    std::optional<at::Tensor> &hs64_num_splits
 ) {
     // Packed caches include scale/RoPE storage beyond D. Only the flat,
     // dimension-matched encoding dispatches to the quantized compute backend.
@@ -142,7 +174,8 @@ sparse_attn_decode_interface(
         auto result = flashmla::quantized_attention::paged_attention(q, kv, head_size_v,
             indices, softmax_scale, attn_sink, topk_length, extra_kv, extra_indices,
             extra_topk_length, out_, enable_batch_invariant);
-        return {result[0], result[1], tile_scheduler_metadata, num_splits};
+        return {result[0], result[1], tile_scheduler_metadata, num_splits,
+                hs64_tile_scheduler_metadata, hs64_num_splits};
     }
 
     bool is_fp8 = (kv.dtype() == torch::kFloat8_e4m3fn ||
@@ -308,6 +341,9 @@ sparse_attn_decode_interface(
         TORCH_CHECK(extra_kv->stride(-1) == 1,
                     "BF16 extra_kv must have contiguous head dimension");
     }
+    // Match the fused SM80 path's encoding convention for packed KV.
+    const bool v41_float_kv = is_fp8 &&
+        (cc_major != 8 || cc_minor != 0 || resolve_v41_float_kv(kv, extra_kv));
 
     const int topk = indices.size(-1);
     CHECK_DEVICE(indices);
@@ -362,6 +398,7 @@ sparse_attn_decode_interface(
     params.h_h_k_ratio = num_heads / num_heads_k;
     params.ngroups = ngroups;
     params.is_causal = false;
+    params.v41_float_kv = v41_float_kv;
     params.topk = topk;
 
     params.d = head_size;
@@ -479,6 +516,20 @@ sparse_attn_decode_interface(
         extra_indices->size(0) == batch_size && extra_indices->size(1) == seqlen_q_ori &&
         extra_indices->stride(-1) == 1 && dense_vector(attn_sink, ngroups)
         ? v41_h8_direct_parts(params) : 0;
+    // Contiguous token rows can use 128-token pages without moving cache bytes.
+    const int64_t alias_tokens = int64_t(num_blocks) * page_block_size;
+    const bool page_alias = !enable_batch_invariant && is_v41_fp8 && is_sm89_or_newer() && ngroups == 64 &&
+        !topk_length && !extra_topk_length &&
+        (page_block_size == 32 || page_block_size == 64 || page_block_size == 256) && params.topk == 128 &&
+        params.extra_topk == 512 && params.extra_page_block_size == 64 &&
+        params.k_batch_stride == int64_t(page_block_size) * 528 && params.v_batch_stride == params.k_batch_stride &&
+        alias_tokens > 0 && alias_tokens % 128 == 0 && alias_tokens / 128 <= std::numeric_limits<int>::max();
+    if (page_alias) {
+        params.num_blocks = alias_tokens / 128;
+        params.page_block_size = 128;
+        params.k_batch_stride = 128 * 528;
+        params.v_batch_stride = params.k_batch_stride;
+    }
     const bool packed_h64 = !enable_batch_invariant && is_v41_fp8 && is_extra_fp4 &&
         kv.device() == q.device() && extra_kv->device() == q.device() && out.device() == q.device() &&
         indices.device() == q.device() && extra_indices && extra_indices->device() == q.device() &&
@@ -498,33 +549,76 @@ sparse_attn_decode_interface(
         dense_vector(topk_length, batch_size) && dense_vector(extra_topk_length, batch_size) &&
         dense_vector(attn_sink, ngroups) &&
         use_v41_packed_fp8_extra_h64(params);
-    at::Tensor hs64_metadata, hs64_num_splits;
-    if (!packed_h64 && !packed_fp8_extra_h64 && is_v41_fp8 &&
+    if (page_alias && !packed_h64 && !packed_fp8_extra_h64) {
+        params.num_blocks = num_blocks;
+        params.page_block_size = page_block_size;
+        params.k_batch_stride = kv.stride(0);
+        params.v_batch_stride = vcache.stride(0);
+    }
+    const bool legacy_int8_hs64 = is_fp8 && !is_v41_fp8 && !v41_float_kv && !enable_batch_invariant &&
+        use_sm80_legacy_int8_hs64(params);
+    at::Tensor hs64_metadata, hs64_num_splits_t;
+    if (legacy_int8_hs64 || (!packed_h64 && !packed_fp8_extra_h64 && is_v41_fp8 &&
         flashmla::dsa::sparse_decode_hs64_v41_supported(params, is_extra_fp4) &&
-        is_sm89_or_newer()) {
-        if (params.b <= 4 && params.q_orig <= params.num_sm_parts) {
-            params.num_sm_parts /= params.q_orig;
+        is_sm89_or_newer())) {
+        // The default packed-cache scheduler advances by 64 tokens. HS64
+        // consumes the separate cached schedule with a 128-token quantum.
+        //
+        // Previously this branch rebuilt that 128-token schedule on EVERY call,
+        // i.e. once per layer, even though all layers sharing one
+        // FlashMLASchedMeta pass identical arguments. The Python layer already
+        // caches per scheduler object and hands the same object back to us on
+        // every layer (flash_mla_interface.py: numpy-free `sched_meta` reuse +
+        // write-back at :245). We reuse that contract here: build the HS64
+        // schedule once and write it back into the caller's tensors, so the
+        // next layer finds it already present.
+        //
+        // FlashMLASchedMeta.config pins b / s_q / h_q / page_block_size / h_k /
+        // causal / is_fp8_kvcache / qkv_fp8 / topk / extra_* for every reuse
+        // (flash_mla_interface.py:194-206), num_sm_parts is a pure function of
+        // those pinned values. It is therefore stable across layers sharing one
+        // scheduler object, and a single cached pair is sufficient.
+        const bool hs64_uses_cached =
+            hs64_tile_scheduler_metadata.has_value() &&
+            hs64_num_splits.has_value() &&
+            hs64_tile_scheduler_metadata->defined() &&
+            hs64_num_splits->defined() &&
+            hs64_tile_scheduler_metadata->dim() == 2 &&
+            hs64_tile_scheduler_metadata->size(1) == TileSchedulerMetaDataSize &&
+            hs64_num_splits->numel() == params.b + 1;
+
+        if (hs64_uses_cached) {
+            // Reuse: adopt the cached tensors and the num_sm_parts they encode.
+            hs64_metadata = *hs64_tile_scheduler_metadata;
+            hs64_num_splits_t = *hs64_num_splits;
+            params.num_sm_parts = hs64_metadata.size(0);
+        } else {
+            // Keep cached FP8 metadata at 64 tokens; HS64 consumes a private 128-token schedule.
+            const auto metadata_options = q.options().dtype(torch::kInt32);
+            hs64_metadata = torch::empty(
+                {params.num_sm_parts, TileSchedulerMetaDataSize}, metadata_options);
+            hs64_num_splits_t = torch::empty({params.b + 1}, metadata_options);
+            Mla_metadata_params hs64_meta_params = {};
+            hs64_meta_params.seqlens_k_ptr = nullptr;
+            hs64_meta_params.tile_scheduler_metadata_ptr = hs64_metadata.data_ptr<int>();
+            hs64_meta_params.num_splits_ptr = hs64_num_splits_t.data_ptr<int>();
+            hs64_meta_params.batch_size = params.b;
+            hs64_meta_params.block_size_n = 128;
+            hs64_meta_params.fixed_overhead_num_blocks = 5;
+            hs64_meta_params.num_sm_parts = params.num_sm_parts;
+            hs64_meta_params.topk = params.topk;
+            hs64_meta_params.extra_topk = params.extra_topk >= 0 ? params.extra_topk : 0;
+            hs64_meta_params.topk_length = params.topk_len_ptr;
+            hs64_meta_params.extra_topk_length = params.extra_topk_len_ptr;
+            get_mla_metadata_func(hs64_meta_params, stream);
         }
-        // Keep cached FP8 metadata at 64 tokens; HS64 consumes a private 128-token schedule.
-        const auto metadata_options = q.options().dtype(torch::kInt32);
-        hs64_metadata = torch::empty(
-            {params.num_sm_parts, TileSchedulerMetaDataSize}, metadata_options);
-        hs64_num_splits = torch::empty({params.b + 1}, metadata_options);
-        Mla_metadata_params hs64_meta_params = {};
-        hs64_meta_params.seqlens_k_ptr = nullptr;
-        hs64_meta_params.tile_scheduler_metadata_ptr = hs64_metadata.data_ptr<int>();
-        hs64_meta_params.num_splits_ptr = hs64_num_splits.data_ptr<int>();
-        hs64_meta_params.batch_size = params.b;
-        hs64_meta_params.block_size_n = 128;
-        hs64_meta_params.fixed_overhead_num_blocks = 5;
-        hs64_meta_params.num_sm_parts = params.num_sm_parts;
-        hs64_meta_params.topk = params.topk;
-        hs64_meta_params.extra_topk = params.extra_topk >= 0 ? params.extra_topk : 0;
-        hs64_meta_params.topk_length = params.topk_len_ptr;
-        hs64_meta_params.extra_topk_length = params.extra_topk_len_ptr;
-        get_mla_metadata_func(hs64_meta_params, stream);
         params.tile_scheduler_metadata_ptr = hs64_metadata.data_ptr<int>();
-        params.num_splits_ptr = hs64_num_splits.data_ptr<int>();
+        params.num_splits_ptr = hs64_num_splits_t.data_ptr<int>();
+        // Publish the HS64 schedule back to the caller so every later layer on
+        // the same FlashMLASchedMeta reuses it (see the cache note above).
+        // Harmless on the reuse path: both already alias the cached tensors.
+        hs64_tile_scheduler_metadata = hs64_metadata;
+        hs64_num_splits = hs64_num_splits_t;
     }
 
     // splitkv
@@ -546,7 +640,9 @@ sparse_attn_decode_interface(
         params.num_sm_parts = h8_direct_parts;
         flashmla::dsa::v41::run_h8_fp8_fp4_direct(params, stream);
     } else if (packed_h64 || packed_fp8_extra_h64) {
-        flashmla::dsa::hs64::run_v41_packed_page_decode(params, stream);
+        flashmla::dsa::hs64::run_v41_packed_page_decode(params, stream, cc_major == 8 && cc_minor == 0);
+    } else if (legacy_int8_hs64) {
+        flashmla::dsa::hs64::run_legacy_int8_decode(params, stream);
     } else if (is_fp8) {
         if (head_size == 576) {
             run_sparse_decode_fwd_dispatch<cutlass::bfloat16_t, true, 576, 512, false>(params, stream);
@@ -574,7 +670,8 @@ sparse_attn_decode_interface(
     softmax_lse = softmax_lse.view({batch_size, num_heads_k, seqlen_q_ori, ngroups}).transpose(2, 3)
             .reshape({batch_size, num_heads_ori, seqlen_q_ori});
 
-    return std::make_tuple(out, softmax_lse, tile_scheduler_metadata, num_splits);
+    return std::make_tuple(out, softmax_lse, tile_scheduler_metadata, num_splits,
+                           hs64_tile_scheduler_metadata, hs64_num_splits);
 }
 
 #endif // FLASHMLA_C_ENABLE_DECODE_SPARSE

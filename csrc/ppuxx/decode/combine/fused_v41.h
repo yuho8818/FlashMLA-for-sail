@@ -7,7 +7,7 @@
 namespace flashmla::fused_norm_rope_attn_rope_cast_fwd::combine {
 
 struct Params {
-    int s_q, h_q, num_sm_parts;
+    int s_q, h_q, num_sm_parts, arch;
     const int* num_splits;
     const float* lse_accum;
     const float* o_accum;
@@ -18,6 +18,7 @@ struct Params {
     uint32_t* out_sf;
     float* lse;
     bool per_token_scale;
+    core_attn::OutputFormat output_format = core_attn::OutputFormat::FP8;
     int64_t stride_out_sf_token;
     int64_t stride_out_sf_group, stride_out_sf_word;
     hggcStream_t stream;

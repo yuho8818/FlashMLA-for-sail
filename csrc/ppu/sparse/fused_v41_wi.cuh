@@ -8,6 +8,7 @@
 #include <cutlass/float8.h>
 
 #include "fused_v41.h"
+#include "fused_v41_output.cuh"
 #include "prefill/sparse/traits.h"
 #include "prefill/sparse/sparse_prefill_wg.cuh"
 
@@ -47,7 +48,7 @@ struct CacheSupplier {
         bool valid, int block_idx, bool async_preissued);
 };
 
-template<FwdMode Mode, int Heads, bool EnableNorm, bool ExtraFP4, int Arch_, bool PerTokenScale = false>
+template<FwdMode Mode, int Heads, bool EnableNorm, bool ExtraFP4, int Arch_, bool PerTokenScale>
 struct Config : ::DSA_Traits<cutlass::bfloat16_t, 512, Arch_> {
     using Base = ::DSA_Traits<cutlass::bfloat16_t, 512, Arch_>;
     static constexpr int Arch = Arch_;
@@ -112,16 +113,16 @@ struct Config : ::DSA_Traits<cutlass::bfloat16_t, 512, Arch_> {
 
     template<typename T, typename TensorO>
     static __forceinline__ __device__ void store_output(
-        const TileParams& p, TensorO& output, typename T::SharedMemoryPlan& plan,
+        const TileParams& p, TensorO& accum, typename T::SharedMemoryPlan& plan,
         int warpgroup_idx, int idx_in_warpgroup);
 };
 
-template<int Heads, bool EnableNorm, bool ExtraFP4, int Arch, bool PerTokenScale = false>
+template<int Heads, bool EnableNorm, bool ExtraFP4, int Arch, bool PerTokenScale>
 struct VectorDecodeConfig : Config<FwdMode::Decode, Heads, EnableNorm, ExtraFP4, Arch, PerTokenScale> {
     static constexpr bool kVectorDecodeKV = true;
 };
 
-template<int Heads, bool EnableNorm, int Arch, bool PerTokenScale = false>
+template<int Heads, bool EnableNorm, int Arch, bool PerTokenScale>
 struct NativePrefillConfig : Config<FwdMode::Prefill, Heads, EnableNorm, false, Arch, PerTokenScale> {
     static constexpr bool kDecode = Arch != 89;
     static constexpr bool kQuantCache = kDecode;
@@ -531,15 +532,18 @@ __forceinline__ __device__ float2 apply_rope(float2 x, float c, float s) {
 
 template<int Rows>
 __forceinline__ __device__ int native_offset(int row, int dim) {
+#if ACOMPUTE_VERSION == 10000
+    // All callers address nonnegative rows/dimensions. Keep this permutation
+    // unsigned so power-of-two divisions do not emit signed remainder fixes.
+    const uint32_t r = uint32_t(row), d = uint32_t(dim);
+    const uint32_t tile = d >> 6, col = d & 63u, slice = col >> 4;
+    const uint32_t rotation = (((slice & 1u) << 1) + ((slice & 2u) >> 1)) * 2u;
+    const uint32_t vec = (((r & 3u) * 2u + ((col & 15u) >> 3)) ^ ((r >> 2) & 1u));
+    return int(tile * Rows * 64u + slice * Rows * 16u + (r >> 2) * 64u
+        + ((vec + rotation) & 7u) * 8u + (col & 7u));
+#else
     const int tile = dim / 64;
     const int col = dim % 64;
-#if ACOMPUTE_VERSION == 10000
-    const int slice = col / 16;
-    const int rotation = (((slice & 1) << 1) + ((slice & 2) >> 1)) * 2;
-    const int vec = (((row % 4) * 2 + (col % 16) / 8) ^ ((row / 4) & 1));
-    return tile * Rows * 64 + slice * Rows * 16 + (row / 4) * 64
-        + ((vec + rotation) % 8) * 8 + col % 8;
-#else
     return tile * Rows * 64 + row * 64 + (col ^ ((row & 7) << 3));
 #endif
 }
@@ -965,7 +969,7 @@ __forceinline__ __device__ void Config<Mode, Heads, EnableNorm, ExtraFP4, Arch, 
 template<FwdMode Mode, int Heads, bool EnableNorm, bool ExtraFP4, int Arch, bool PerTokenScale>
 template<typename T, typename TensorO>
 __forceinline__ __device__ void Config<Mode, Heads, EnableNorm, ExtraFP4, Arch, PerTokenScale>::store_output(
-    const TileParams& p, TensorO& output, typename T::SharedMemoryPlan& plan,
+    const TileParams& p, TensorO& accum, typename T::SharedMemoryPlan& plan,
     int warpgroup_idx, int idx_in_warpgroup) {
     const auto& fused = *p.fused;
     const int head = threadIdx.x / 4;
@@ -996,7 +1000,7 @@ __forceinline__ __device__ void Config<Mode, Heads, EnableNorm, ExtraFP4, Arch, 
     typename T::TiledMma mma;
     auto copy_c = make_tiled_copy_C(typename T::SmemCopyAtomOaccum{}, mma);
     auto copy_thr = copy_c.get_slice(idx_in_warpgroup);
-    Tensor src = copy_thr.retile_S(output);
+    Tensor src = copy_thr.retile_S(accum);
     Tensor dst = copy_thr.partition_D(half);
     if constexpr(T::kUsePairedCubes) {
         #pragma unroll
@@ -1013,35 +1017,41 @@ __forceinline__ __device__ void Config<Mode, Heads, EnableNorm, ExtraFP4, Arch, 
     }
     __syncthreads();
 
+    const OutputFormat format = Mode == FwdMode::Decode && Arch == 80
+        ? fused.output_format : OutputFormat::FP8;
+    const bool int8_output = format == OutputFormat::INT8;
     float group_scale_inv = 0.0f;
     if constexpr(PerTokenScale) {
-        // Four lanes cover one head; a warp covers one complete WV group.
-        float group_amax = 0.0f;
-        if(head < p.real_heads && multiplier != 0.0f) {
-            #pragma unroll
-            for(int step = 0; step < 4; ++step) {
-                const int tile = lane + step * 4;
+        if(format != OutputFormat::BF16) {
+            // Four lanes cover one head; a warp covers one complete WV group.
+            float group_amax = 0.0f;
+            if(head < p.real_heads && multiplier != 0.0f) {
                 #pragma unroll
-                for(int i = 0; i < 32; i += 2) {
-                    float2 value{staged(head, tile * 32 + i), staged(head, tile * 32 + i + 1)};
-                    if(tile >= 14) {
-                        const int pair = (tile - 14) * 16 + i / 2;
-                        value = apply_rope(value, __ldg(rope + pair), -__ldg(rope + 32 + pair));
+                for(int step = 0; step < 4; ++step) {
+                    const int tile = lane + step * 4;
+                    #pragma unroll
+                    for(int i = 0; i < 32; i += 2) {
+                        float2 value{staged(head, tile * 32 + i), staged(head, tile * 32 + i + 1)};
+                        if(tile >= 14) {
+                            const int pair = (tile - 14) * 16 + i / 2;
+                            value = apply_rope(value, __ldg(rope + pair), -__ldg(rope + 32 + pair));
+                        }
+                        group_amax = fmaxf(group_amax, fmaxf(fabsf(value.x), fabsf(value.y)));
                     }
-                    group_amax = fmaxf(group_amax, fmaxf(fabsf(value.x), fabsf(value.y)));
                 }
+                group_amax *= multiplier;
             }
-            group_amax *= multiplier;
-        }
-        #pragma unroll
-        for(int offset = 16; offset >= 1; offset /= 2) {
-            group_amax = fmaxf(group_amax, __shfl_xor_sync(0xffffffffu, group_amax, offset));
-        }
-        const float scale = fmaxf(1e-4f, group_amax) / 448.0f;
-        group_scale_inv = __fdividef(1.0f, scale);
-        if((threadIdx.x & 31) == 0 && head < p.real_heads) {
-            reinterpret_cast<float*>(fused.out_sf)[int64_t(p.token_idx) * fused.stride_out_sf_token
-                + int64_t(head / 8) * fused.stride_out_sf_group] = scale;
+            #pragma unroll
+            for(int offset = 16; offset >= 1; offset /= 2) {
+                group_amax = fmaxf(group_amax, __shfl_xor_sync(0xffffffffu, group_amax, offset));
+            }
+            group_amax = fmaxf(1e-4f, group_amax);
+            const float scale = output::quant_scale(group_amax, format);
+            group_scale_inv = __fdividef(1.0f, scale);
+            if((threadIdx.x & 31) == 0 && head < p.real_heads) {
+                reinterpret_cast<float*>(fused.out_sf)[int64_t(p.token_idx) * fused.stride_out_sf_token
+                    + int64_t(head / 8) * fused.stride_out_sf_group] = scale;
+            }
         }
     }
 
@@ -1072,6 +1082,17 @@ __forceinline__ __device__ void Config<Mode, Heads, EnableNorm, ExtraFP4, Arch, 
                     values[i + 1] = rotated.y;
                 }
             }
+            const int group = head / 8;
+            const int in_group = head & 7;
+            const int64_t out_offset = int64_t(p.token_idx) * p.real_heads * 512
+                + group * (8 * 512) + tile * (8 * 32) + in_group * 32;
+            if(format == OutputFormat::BF16) {
+                #pragma unroll
+                for(int i = 0; i < 32; ++i) {
+                    output::store_bf16(fused.out_fp8, out_offset + i, values[i] * multiplier);
+                }
+                continue;
+            }
             int exponent = 0;
             float cast_multiplier = multiplier * group_scale_inv;
             if constexpr(!PerTokenScale) {
@@ -1086,13 +1107,18 @@ __forceinline__ __device__ void Config<Mode, Heads, EnableNorm, ExtraFP4, Arch, 
                 }
                 float amax = fmaxf(fmaxf(amax0, amax1), fmaxf(amax2, amax3));
                 amax = fmaxf(1e-4f, amax * multiplier);
-                const float scale = amax / 448.0f;
+                const float scale = output::quant_scale(amax, format);
                 exponent = int((__float_as_uint(scale) - 1u) >> 23) + 1 - 127;
                 const float scale_inv = __uint_as_float(uint32_t(127 - exponent) << 23);
                 cast_multiplier = multiplier * scale_inv;
             }
             alignas(Arch == 89 ? 16 : 1) uint8_t packed[32];
-            if constexpr(Arch == 89) {
+            if(int8_output) {
+                #pragma unroll
+                for(int i = 0; i < 32; ++i) {
+                    packed[i] = output::pack_int8(values[i] * cast_multiplier);
+                }
+            } else if constexpr(Arch == 89) {
                 auto* pairs = reinterpret_cast<uint16_t*>(packed);
                 #pragma unroll
                 for(int i = 0; i < 32; i += 2) {
@@ -1105,10 +1131,6 @@ __forceinline__ __device__ void Config<Mode, Heads, EnableNorm, ExtraFP4, Arch, 
                     packed[i] = cutlass::float_e4m3_t::from_float(values[i] * cast_multiplier).storage;
                 }
             }
-            const int group = head / 8;
-            const int in_group = head & 7;
-            const int64_t out_offset = int64_t(p.token_idx) * p.real_heads * 512
-                + group * (8 * 512) + tile * (8 * 32) + in_group * 32;
             if constexpr(Arch == 89) {
                 auto* out = reinterpret_cast<uint4*>(fused.out_fp8 + out_offset);
                 const auto* words = reinterpret_cast<const uint4*>(packed);
@@ -1175,7 +1197,7 @@ __forceinline__ __device__ TileParams make_tile(const Params& fused, int token) 
 
 template<typename T>
 __global__ void __launch_bounds__(T::NUM_THREADS, 1, 1)
-fused_norm_rope_attn_rope_cast_fwd_kernel(__grid_constant__ const typename T::KernelParams params) {
+fused_norm_rope_attn_rope_cast_wi_kernel(__grid_constant__ const typename T::KernelParams params) {
     const int token = blockIdx.x;
     const TileParams tile = make_tile<T>(params, token);
     fused_wi::tile_body<T>(tile, 0);
@@ -1189,7 +1211,7 @@ void launch(const Params& params) {
     if constexpr(Mode == FwdMode::Prefill && Arch == 89) {
         if(params.topk_length == nullptr) {
             using V = NativePrefillConfig<Heads, EnableNorm, Arch, PerTokenScale>;
-            auto native_kernel = &fused_norm_rope_attn_rope_cast_fwd_kernel<V>;
+            auto native_kernel = &fused_norm_rope_attn_rope_cast_wi_kernel<V>;
             C10_CUDA_CHECK(hggcFuncSetAttribute(native_kernel, hggcFuncAttributeMaxDynamicSharedMemorySize, bytes));
             native_kernel<<<dim3(params.s_q, 1, 1), V::NUM_THREADS, bytes, params.stream>>>(kernel_params);
             CHECK_CUDA_KERNEL_LAUNCH();
@@ -1199,14 +1221,14 @@ void launch(const Params& params) {
     if constexpr(Mode == FwdMode::Decode && Arch == 89 && Heads == 128) {
         if(params.extra_topk > 0) {
             using V = VectorDecodeConfig<Heads, EnableNorm, ExtraFP4, Arch, PerTokenScale>;
-            auto vector_kernel = &fused_norm_rope_attn_rope_cast_fwd_kernel<V>;
+            auto vector_kernel = &fused_norm_rope_attn_rope_cast_wi_kernel<V>;
             C10_CUDA_CHECK(hggcFuncSetAttribute(vector_kernel, hggcFuncAttributeMaxDynamicSharedMemorySize, bytes));
             vector_kernel<<<dim3(params.s_q, 1, 1), V::NUM_THREADS, bytes, params.stream>>>(kernel_params);
             CHECK_CUDA_KERNEL_LAUNCH();
             return;
         }
     }
-    auto kernel = &fused_norm_rope_attn_rope_cast_fwd_kernel<T>;
+    auto kernel = &fused_norm_rope_attn_rope_cast_wi_kernel<T>;
     C10_CUDA_CHECK(hggcFuncSetAttribute(kernel, hggcFuncAttributeMaxDynamicSharedMemorySize, bytes));
     kernel<<<dim3(params.s_q, 1, 1), T::NUM_THREADS, bytes, params.stream>>>(kernel_params);
     CHECK_CUDA_KERNEL_LAUNCH();
@@ -1219,12 +1241,16 @@ void run_fused_norm_rope_attn_rope_cast_fwd_kernel(const Params& params) {
     if constexpr(Mode == FwdMode::Decode) TORCH_CHECK(params.extra_fp4 == ExtraFP4);
     if(params.s_q == 0) return;
     if(params.arch == 80) {
-        TORCH_CHECK(!params.per_token_scale, "Per-token FP32 output scales currently require PPU SM89");
-        launch<Mode, Heads, EnableNorm, ExtraFP4, 80, false>(params);
+        if (params.per_token_scale) launch<Mode, Heads, EnableNorm, ExtraFP4, 80, true>(params);
+        else launch<Mode, Heads, EnableNorm, ExtraFP4, 80, false>(params);
     } else {
         TORCH_CHECK(params.arch == 89, "Fused WI requires SM80 or SM89");
-        if (params.per_token_scale) launch<Mode, Heads, EnableNorm, ExtraFP4, 89, true>(params);
-        else launch<Mode, Heads, EnableNorm, ExtraFP4, 89, false>(params);
+        if constexpr (Mode == FwdMode::Prefill && Heads == 128) {
+            run_fused_norm_rope_attn_rope_cast_prefill_h128<EnableNorm>(params);
+        } else {
+            if (params.per_token_scale) launch<Mode, Heads, EnableNorm, ExtraFP4, 89, true>(params);
+            else launch<Mode, Heads, EnableNorm, ExtraFP4, 89, false>(params);
+        }
     }
 }
 
