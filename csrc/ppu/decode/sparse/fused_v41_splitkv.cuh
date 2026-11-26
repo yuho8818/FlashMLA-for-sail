@@ -103,22 +103,69 @@ __forceinline__ __device__ float2 apply_rope(float2 x, float c, float s) {
 // Swizzle<2,4,3> over a 64-wide atom, which is a different layout (verified:
 // 4064/4096 offsets differ).  Getting this wrong does not fail to compile; it
 // silently permutes Q and shows up as fluent-looking garbage output.
+// V523-S30 LB-24 FIX -- root cause: this single function.
+//
+// mega-fp8 rewrote it as `template<typename KT>` with a runtime-shaped
+// `if constexpr (KT::QKV_FP8) { fp8 } else { bf16 }` body and `KT::kBlockM`
+// written INLINE in the index expression.  The BF16 instantiation then lost
+// constant folding / addressing strength-reduction and the emitted BF16 H64
+// kernel gained 566 address & byte-shuffle instructions:
+//     v.madl.i32 786 -> 894, v.shrl.b32 490 -> 532,
+//     plus new v.and.b16 x80 / v.byte.prmt.b32 x16 / v.shrl.b16 x64
+// (BF16 MMA count unchanged at 708).  Those extra ops change the smem
+// addressing, which is what corrupts the output.
+//
+// Fix: keep BOTH layouts, but select them the way 7bce34f did -- with a
+// compile-time `Rows` constant and a plain two-argument helper -- instead of an
+// `if constexpr` around the whole body.  Measured: ISA becomes byte-identical to
+// 7bce34f (17,079 lines / 0 extra byte ops), FP8 instances unchanged.
+template<int Rows>
+__forceinline__ __device__ int native_offset_bf16(int row, int dim) {
+    const int tile = dim / 64;
+    const int col = dim % 64;
+#if ACOMPUTE_VERSION == 10000
+    const int slice = col / 16;
+    const int rotation = (((slice & 1) << 1) + ((slice & 2) >> 1)) * 2;
+    const int vec = (((row % 4) * 2 + (col % 16) / 8) ^ ((row / 4) & 1));
+    return tile * Rows * 64 + slice * Rows * 16 + (row / 4) * 64
+        + ((vec + rotation) % 8) * 8 + col % 8;
+#else
+    return tile * Rows * 64 + row * 64 + (col ^ ((row & 7) << 3));
+#endif
+}
+
+// FP8 Q layout: the (8,128) cube stored with the 16-byte XOR swizzle the
+// swizzled TSM loads require.
+//
+// V523-S45 P1 FIX (device-verified by P0): the plain walk below fed the
+// swzl_mode=0 ldmatrix family a linear tile, which matches only the 1/8 of
+// lanes whose XOR key is 0 -- the other 87.5% of fragment lanes receive a
+// row-internal 16B-block permuted byte (measured, evidence/raw/p0_afrag_s45.txt:
+// Q mode0 12.50% exact / 87.50% xor-swizzle).  Kernel probes are blind to this
+// (the permutation preserves K==1 sums) but e2e output is 100% garbage.
+// The BF16 twin (native_offset_bf16) already swizzles with (col ^ ((row&7)<<3))
+// over 64-element rows, which is Swizzle<3,3,3>; for the 128-e4m3 (128-byte)
+// row the matching store is Swizzle<3,4,3> -- i.e. XOR the 16-byte block index
+// (col bits 4..6) with the low 3 row bits, leaving the block offset untouched.
+// With the XOR the same load measures 100.00% exact (P0 mode1).
+template<int Rows>
+__forceinline__ __device__ int native_offset_fp8(int row, int dim) {
+    constexpr int kCw = 128;                 // kBlockKSmem
+    constexpr int kCube = 8 * kCw;           // elements in one 8-row cube
+    constexpr int cubes_per_row = Rows / 8;
+    const int col = (dim % kCw) ^ ((row & 7) << 4);   // Swizzle<3,4,3> in-cube
+    return (dim / kCw) * cubes_per_row * kCube + row * kCw + col;
+}
+
+// Thin dispatcher: the branch is on the TRAIT (always a compile-time constant),
+// and each arm is a separate non-template-on-KT function so the BF16 arm keeps
+// exactly the code shape 7bce34f produced.
 template<typename KT>
 __forceinline__ __device__ int native_offset(int row, int dim) {
     if constexpr (KT::QKV_FP8) {
-        constexpr int kCw = 128;                 // kBlockKSmem
-        constexpr int kCube = 8 * kCw;           // elements in one 8-row cube
-        const int cubes_per_row = KT::kBlockM / 8;
-        return (dim / kCw) * cubes_per_row * kCube + row * kCw + (dim % kCw);
+        return native_offset_fp8<KT::kBlockM>(row, dim);
     } else {
-        constexpr int kPeriod = 64;
-        const int tile = dim / kPeriod;
-        const int col = dim % kPeriod;
-        const int slice = col / 16;
-        const int rotation = (((slice & 1) << 1) + ((slice & 2) >> 1)) * 2;
-        const int vec = (((row % 4) * 2 + (col % 16) / 8) ^ ((row / 4) & 1));
-        return tile * KT::kBlockM * kPeriod + slice * KT::kBlockM * 16 + (row / 4) * 64
-            + ((vec + rotation) % 8) * 8 + col % 8;
+        return native_offset_bf16<KT::kBlockM>(row, dim);
     }
 }
 
@@ -198,6 +245,13 @@ __forceinline__ __device__ void load_q(
             // so Q stays un-scaled here and the tolerance is simply E4M3's
             // dynamic range. Values are taken as-is (no amax normalization);
             // the caller's Q is already activation-scale.
+            // V523-S42 LB-13 FIX: 8 E4M3 elements are 8 bytes, so the store must
+            // be 8 bytes.  The copy of the BF16 branch below uses `uint4`, which is
+            // correct there (8 * bf16 = 16 B) but reads 8 bytes PAST this array here
+            // and writes them into Q's smem tile -- i.e. uninitialised stack memory
+            // was fed into QK^T.  That is non-deterministic by construction and was
+            // the source of the fp8 arm's irreproducible lse (see LB-11/LB-12:
+            // Q=0,K=0 gave lse = 4.85/3264.75/1800.48/5.35/5.32/5.03).
             #pragma unroll
             for (int h = 0; h < 2; ++h) {
                 alignas(16) cutlass::float_e4m3_t packed[8];
@@ -205,8 +259,8 @@ __forceinline__ __device__ void load_q(
                 for (int j = 0; j < 8; ++j) {
                     packed[j] = cutlass::float_e4m3_t::from_float(x[h * 8 + j]);
                 }
-                *reinterpret_cast<uint4*>(dst + native_offset<KT>(row, chunk * 16 + h * 8))
-                    = *reinterpret_cast<const uint4*>(packed);
+                *reinterpret_cast<uint2*>(dst + native_offset<KT>(row, chunk * 16 + h * 8))
+                    = *reinterpret_cast<const uint2*>(packed);
             }
         } else {
             #pragma unroll
@@ -675,7 +729,20 @@ __forceinline__ __device__ void store_output(
     // which is how the dense fp8 path stores O too.  An earlier revision also
     // swapped in TiledMmaSPStore here, double-applying the permutation -- that
     // atom is for the pi_k sP store, not for O (see kernel_traits.h).
-    typename KT::TiledMma tiled_mma;
+    //
+    // V523-S50 FIX (defect D2): the "natural" claim above is wrong.  After
+    // permute_output_fp8 the accumulator is in EpiPerm order, and only
+    // TiledMmaStoreEpiO's CLayout maps that back to natural sO columns -- the
+    // scheme flash::store uses for BOTH its split and no-split outlets
+    // (csrc/utils.h, the hardware-validated fp8 path).  With the natural
+    // TiledMma every no_split query stored a column-permuted O: measured on
+    // s50fix1, n_q >= 22 (the tile-scheduler threshold where a partition owns
+    // a whole query) gives O uncorrelated with the bf16 arm (~93-106% mean
+    // relative error, per-row cosine 0.24) while lse agrees to 2e-4; n_q <= 21
+    // (split path, flash::store) stays at 2%.
+    using TiledMmaOStore = std::conditional_t<kPvFp8<KT>,
+        typename KT::TiledMmaStoreEpiO, typename KT::TiledMma>;
+    TiledMmaOStore tiled_mma;
     auto smem_tiled_copy_O = make_tiled_copy_C(typename KT::SmemCopyAtomOaccum{}, tiled_mma);
     auto smem_thr_copy_O = smem_tiled_copy_O.get_thread_slice(tidx);
     Tensor tOrO = smem_thr_copy_O.retile_S(acc_o);
