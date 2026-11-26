@@ -231,6 +231,13 @@ __forceinline__ __device__ void load_q(
             // so Q stays un-scaled here and the tolerance is simply E4M3's
             // dynamic range. Values are taken as-is (no amax normalization);
             // the caller's Q is already activation-scale.
+            // V523-S42 LB-13 FIX: 8 E4M3 elements are 8 bytes, so the store must
+            // be 8 bytes.  The copy of the BF16 branch below uses `uint4`, which is
+            // correct there (8 * bf16 = 16 B) but reads 8 bytes PAST this array here
+            // and writes them into Q's smem tile -- i.e. uninitialised stack memory
+            // was fed into QK^T.  That is non-deterministic by construction and was
+            // the source of the fp8 arm's irreproducible lse (see LB-11/LB-12:
+            // Q=0,K=0 gave lse = 4.85/3264.75/1800.48/5.35/5.32/5.03).
             #pragma unroll
             for (int h = 0; h < 2; ++h) {
                 alignas(16) cutlass::float_e4m3_t packed[8];
@@ -238,8 +245,8 @@ __forceinline__ __device__ void load_q(
                 for (int j = 0; j < 8; ++j) {
                     packed[j] = cutlass::float_e4m3_t::from_float(x[h * 8 + j]);
                 }
-                *reinterpret_cast<uint4*>(dst + native_offset<KT>(row, chunk * 16 + h * 8))
-                    = *reinterpret_cast<const uint4*>(packed);
+                *reinterpret_cast<uint2*>(dst + native_offset<KT>(row, chunk * 16 + h * 8))
+                    = *reinterpret_cast<const uint2*>(packed);
             }
         } else {
             #pragma unroll
