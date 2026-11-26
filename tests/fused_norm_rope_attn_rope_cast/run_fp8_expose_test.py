@@ -16,10 +16,12 @@ KNOWN DEFECT MAP OF THE PRE-FIX WHEEL (s45fix4, .so sha256 c38e0245...,
 measured by this task's diagnostics, extra=None unless noted):
 
   * defect D (V523-S50's target): FP4 extra KV cache -> fp8 arm diverges
-    wildly (O ~1e3..3e5 %, lse ~2-4x) while the BF16 arm stays correct.
+    wildly (O 9.5e4..1.1e6 %, lse 86..378 %, measured over the 214 broken
+    cells of the 216-cell full sweep; the two remaining cells come out
+    bitwise identical between arms) while the BF16 arm stays correct.
     Never covered before: all probes passed extra=None.
   * defect E (NEW, found by this task): extra=None fp8 arm diverges
-    (O ~104-108 %, lse stays perfect at ~0.002 %) iff topk < 72 or
+    (O ~93..108 %, lse stays perfect at <= 0.004 %) iff topk < 72 or
     b*s_q >= 6.  The S45 probe shape (b*s_q=4, topk=128) sits inside the
     green island (b*s_q <= 5 and topk >= 72), which is why it looked fixed.
     Reported to V523-S50; NOT fixed by this task (coordination boundary).
