@@ -103,22 +103,55 @@ __forceinline__ __device__ float2 apply_rope(float2 x, float c, float s) {
 // Swizzle<2,4,3> over a 64-wide atom, which is a different layout (verified:
 // 4064/4096 offsets differ).  Getting this wrong does not fail to compile; it
 // silently permutes Q and shows up as fluent-looking garbage output.
+// V523-S30 LB-24 FIX -- root cause: this single function.
+//
+// mega-fp8 rewrote it as `template<typename KT>` with a runtime-shaped
+// `if constexpr (KT::QKV_FP8) { fp8 } else { bf16 }` body and `KT::kBlockM`
+// written INLINE in the index expression.  The BF16 instantiation then lost
+// constant folding / addressing strength-reduction and the emitted BF16 H64
+// kernel gained 566 address & byte-shuffle instructions:
+//     v.madl.i32 786 -> 894, v.shrl.b32 490 -> 532,
+//     plus new v.and.b16 x80 / v.byte.prmt.b32 x16 / v.shrl.b16 x64
+// (BF16 MMA count unchanged at 708).  Those extra ops change the smem
+// addressing, which is what corrupts the output.
+//
+// Fix: keep BOTH layouts, but select them the way 7bce34f did -- with a
+// compile-time `Rows` constant and a plain two-argument helper -- instead of an
+// `if constexpr` around the whole body.  Measured: ISA becomes byte-identical to
+// 7bce34f (17,079 lines / 0 extra byte ops), FP8 instances unchanged.
+template<int Rows>
+__forceinline__ __device__ int native_offset_bf16(int row, int dim) {
+    const int tile = dim / 64;
+    const int col = dim % 64;
+#if ACOMPUTE_VERSION == 10000
+    const int slice = col / 16;
+    const int rotation = (((slice & 1) << 1) + ((slice & 2) >> 1)) * 2;
+    const int vec = (((row % 4) * 2 + (col % 16) / 8) ^ ((row / 4) & 1));
+    return tile * Rows * 64 + slice * Rows * 16 + (row / 4) * 64
+        + ((vec + rotation) % 8) * 8 + col % 8;
+#else
+    return tile * Rows * 64 + row * 64 + (col ^ ((row & 7) << 3));
+#endif
+}
+
+// FP8 Q layout: plain strided walk over the 128-wide USE_AIU atom.
+template<int Rows>
+__forceinline__ __device__ int native_offset_fp8(int row, int dim) {
+    constexpr int kCw = 128;                 // kBlockKSmem
+    constexpr int kCube = 8 * kCw;           // elements in one 8-row cube
+    constexpr int cubes_per_row = Rows / 8;
+    return (dim / kCw) * cubes_per_row * kCube + row * kCw + (dim % kCw);
+}
+
+// Thin dispatcher: the branch is on the TRAIT (always a compile-time constant),
+// and each arm is a separate non-template-on-KT function so the BF16 arm keeps
+// exactly the code shape 7bce34f produced.
 template<typename KT>
 __forceinline__ __device__ int native_offset(int row, int dim) {
     if constexpr (KT::QKV_FP8) {
-        constexpr int kCw = 128;                 // kBlockKSmem
-        constexpr int kCube = 8 * kCw;           // elements in one 8-row cube
-        const int cubes_per_row = KT::kBlockM / 8;
-        return (dim / kCw) * cubes_per_row * kCube + row * kCw + (dim % kCw);
+        return native_offset_fp8<KT::kBlockM>(row, dim);
     } else {
-        constexpr int kPeriod = 64;
-        const int tile = dim / kPeriod;
-        const int col = dim % kPeriod;
-        const int slice = col / 16;
-        const int rotation = (((slice & 1) << 1) + ((slice & 2) >> 1)) * 2;
-        const int vec = (((row % 4) * 2 + (col % 16) / 8) ^ ((row / 4) & 1));
-        return tile * KT::kBlockM * kPeriod + slice * KT::kBlockM * 16 + (row / 4) * 64
-            + ((vec + rotation) % 8) * 8 + col % 8;
+        return native_offset_bf16<KT::kBlockM>(row, dim);
     }
 }
 
