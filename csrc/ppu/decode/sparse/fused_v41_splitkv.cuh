@@ -134,13 +134,27 @@ __forceinline__ __device__ int native_offset_bf16(int row, int dim) {
 #endif
 }
 
-// FP8 Q layout: plain strided walk over the 128-wide USE_AIU atom.
+// FP8 Q layout: the (8,128) cube stored with the 16-byte XOR swizzle the
+// swizzled TSM loads require.
+//
+// V523-S45 P1 FIX (device-verified by P0): the plain walk below fed the
+// swzl_mode=0 ldmatrix family a linear tile, which matches only the 1/8 of
+// lanes whose XOR key is 0 -- the other 87.5% of fragment lanes receive a
+// row-internal 16B-block permuted byte (measured, evidence/raw/p0_afrag_s45.txt:
+// Q mode0 12.50% exact / 87.50% xor-swizzle).  Kernel probes are blind to this
+// (the permutation preserves K==1 sums) but e2e output is 100% garbage.
+// The BF16 twin (native_offset_bf16) already swizzles with (col ^ ((row&7)<<3))
+// over 64-element rows, which is Swizzle<3,3,3>; for the 128-e4m3 (128-byte)
+// row the matching store is Swizzle<3,4,3> -- i.e. XOR the 16-byte block index
+// (col bits 4..6) with the low 3 row bits, leaving the block offset untouched.
+// With the XOR the same load measures 100.00% exact (P0 mode1).
 template<int Rows>
 __forceinline__ __device__ int native_offset_fp8(int row, int dim) {
     constexpr int kCw = 128;                 // kBlockKSmem
     constexpr int kCube = 8 * kCw;           // elements in one 8-row cube
     constexpr int cubes_per_row = Rows / 8;
-    return (dim / kCw) * cubes_per_row * kCube + row * kCw + (dim % kCw);
+    const int col = (dim % kCw) ^ ((row & 7) << 4);   // Swizzle<3,4,3> in-cube
+    return (dim / kCw) * cubes_per_row * kCube + row * kCw + col;
 }
 
 // Thin dispatcher: the branch is on the TRAIT (always a compile-time constant),

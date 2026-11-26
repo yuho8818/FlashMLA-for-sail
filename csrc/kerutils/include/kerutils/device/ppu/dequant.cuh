@@ -633,9 +633,20 @@ struct KVCacheG2SFP8 {
                 const uint32_t packed = p32[m];
                 cutlass::float_e4m3_t e0; e0.storage = uint8_t(packed & 0xFF);
                 cutlass::float_e4m3_t e1; e1.storage = uint8_t((packed >> 8) & 0xFF);
+                cutlass::float_e4m3_t e2; e2.storage = uint8_t((packed >> 16) & 0xFF);
+                cutlass::float_e4m3_t e3; e3.storage = uint8_t((packed >> 24) & 0xFF);
                 cutlass::float_e4m3_t o0 = cutlass::float_e4m3_t::from_float(float(e0) * sf);
                 cutlass::float_e4m3_t o1 = cutlass::float_e4m3_t::from_float(float(e1) * sf);
-                p32[m] = uint32_t(o0.storage) | (uint32_t(o1.storage) << 8);
+                cutlass::float_e4m3_t o2 = cutlass::float_e4m3_t::from_float(float(e2) * sf);
+                cutlass::float_e4m3_t o3 = cutlass::float_e4m3_t::from_float(float(e3) * sf);
+                // V523-S45 P3 FIX: the store used to rebuild p32[m] from o0/o1 only,
+                // silently zeroing bytes 2 and 3 of every 32-bit word -- i.e. half of
+                // the staged K/V columns read as exact 0.  That is the structural
+                // 0.5x on every score (K==1 probes are blind to it: the surviving
+                // half still sums, so the ratio looks like a clean 0.5 scaling;
+                // kernel-side dump measured acc_s(0..3) = 1,1,0,0 for K all-1.0).
+                p32[m] = uint32_t(o0.storage) | (uint32_t(o1.storage) << 8)
+                       | (uint32_t(o2.storage) << 16) | (uint32_t(o3.storage) << 24);
             }
         });
         #pragma unroll

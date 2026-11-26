@@ -89,13 +89,18 @@ __forceinline__ __device__ void compute_attn_fp8_sparse_splitkv(
         __syncthreads();
     }
 
-    // V523-S23: when the GEMMs run in fp8, K is consumed straight out of the E4M3
-    // staging by gemm_pv_fp8_vdirect, so the loader must WRITE the tile in the
-    // walk V-direct indexes (plain (8,128) tiles, 8192 B cubes).
-    // The default (Swizzle<3,4,3>, 1024 B cubes) is right for the bf16 path,
-    // which dequantizes the staging in place before use.
+    // V523-S45 P2 FIX (device-verified by P0): the E4M3 staging must be written
+    // with the Swizzle<3,4,3> layout the swizzled TSM loads require.  The V523-S23
+    // note claimed V-direct indexes a plain (8,128) walk, so Fp8VDirectK forced the
+    // plain atom -- but P0 measured the opposite: the V-direct TsmOp (b16 trans
+    // swzl, CUBE 64x64) reading plain staging mismatches on 32/32 probe points,
+    // and reading Swizzle<3,4,3> staging matches 32/32 (multiset over all lanes;
+    // evidence/raw/p0_afrag_s45.txt).  The QK^T B-side TSM load on plain staging
+    // is 87.5% lane-permuted as well.  V-direct's own walk needs no change: it
+    // already issues swizzled loads over the same logical cube order, so with the
+    // staging swizzled both consumers read correct data.
     using KVCacheGmem = KVCacheG2SFP8<kBlockN, Kernel_traits::kNThreads, kHeadDim, IsV41FP8,
-                                      /*Fp8VDirectK=*/Kernel_traits::QKV_FP8>;
+                                      /*Fp8VDirectK=*/false>;
 
     using ElementKVCache = typename KVCacheGmem::ElementKVCache;
     using SmemLayoutKNoAiu = typename KVCacheGmem::SmemLayoutK;
@@ -579,6 +584,7 @@ using SmemLayoutKActive = std::conditional_t<Kernel_traits::QKV_FP8,
                 }
             }
             flash::apply_indices_mask<kBlockN / 4>(acc_s, smem_valid_indices, warpN_idx, buf_idx);
+
 
             if constexpr (IS_FIRST_BLOCK) {
                 softmax.template softmax_rescale_per_warp</*Is_first=*/true,  /*Check_inf=*/true>(acc_s, smem_row_via_warp, smem_row_scale, params.scale_softmax_log2);
