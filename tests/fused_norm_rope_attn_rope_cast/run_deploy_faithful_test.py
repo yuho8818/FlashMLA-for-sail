@@ -32,8 +32,9 @@ measures it, with the deployment's own parameters, one dimension at a time.
 WHAT "DEPLOYMENT-FAITHFUL" MEANS HERE (each cell is a single-variable deviation
 from the previous one, criteria fixed BEFORE the run)
 -----------------------------------------------------
-  d1  short-context single block : b*s_q=1, s_kv=20, topk=20, extra=None
-                                   == the deployment's short-prompt decode
+  d1  short-context single block : b*s_q=1, s_kv=topk=len (5/8/12/20), extra=None
+                                   == the deployment's short-prompt effective
+                                   attend count (the row is fully live here)
   d2  topk=512 (the deployment's ``index_topk``, never tested: S51 max 256)
   d3  extra sized to the deployment: extra_topk=512 (what the indexer selects),
       extra_s_k=512; the ``candidate_topk_blocks=2048`` figure is a *candidate*
@@ -44,6 +45,9 @@ from the previous one, criteria fixed BEFORE the run)
       (``use_tma_aligned_col_major_sf`` / ``round_sf`` / ``use_packed_ue8m0``)
   d6  attn_sink: default official random sink vs the deployment-shaped sink
       (all-zero finite => no sink), plus an explicit +/-inf pattern
+  d8  PARTIAL index row: s_kv < topk = 512, topk_length = min(s_kv, SWA_WINDOW)
+      -- the mega path's real shape, a wide row that is mostly dead.  This is
+      the aspect d1 cannot reach (there topk == s_kv, so topk_length is None)
 
 Two candidate differences from the task contract were resolved by code reading
 and are therefore NOT variables here (see s52_params.md section 3):
@@ -109,6 +113,7 @@ CAL_LSE_REL_TOL = 4.01 / 65536
 
 # S51's measured defect-E boundary, restated here only for labelling the output.
 DEFECT_E_MIN_GREEN_TOPK = 72
+DEFECT_E_MAX_GREEN_BS = 5        # S51: b*s_q >= 6 is the second defect-E edge
 
 # Deployment constants (sources in evidence/raw/s52_params.md).
 DEPLOY_INDEX_TOPK = 512            # config.json text_config.index_topk
@@ -185,24 +190,42 @@ def build_cases(args):
 
     # ---- d1: short-context single block, extra=None ----------------------- #
     # The deployment's short prompt: b*s_q=1, s_kv=s_q=len, topk=len, no extra.
-    # topk_length is set to len (auto), so the effective attend count is len --
-    # below 72 for every one of these, i.e. inside defect E's region.
+    #
+    # NOTE on what this does and does not exercise (V523-S52 review, item 1):
+    # here ``topk == s_kv == len``, so ``eff == topk`` and the runner passes
+    # ``topk_length=None`` -- i.e. these cells exercise "short context, extra
+    # off, whole index row live", NOT a partially-filled row.  That is still
+    # exactly the deployment's short-prompt *effective attend count* (the
+    # quantity defect E keys on), but the "partial row" aspect is covered by d8
+    # rather than here.  The earlier labelling of these cells as
+    # ``topk_length = min(seq,128)`` over-claimed; see the module docstring.
     for L in DEPLOY_SHORT_PROMPT_LENS:
         cases.append(("d1_short_ctx_none", _case(
-            s_kv=L, topk=L, label=f"short-prompt len={L} (swa_topk_lengths={L}<72)")))
-
-    # d1 control: the same tiny shapes but with the pre-S52 convention where the
-    # whole topk row is live (topk_length == topk == len) -- identical here,
-    # because len < 72 already; kept explicit so the "auto" convention is visible.
-    cases.append(("d1_short_ctx_none", _case(
-        s_kv=20, topk=20, topk_length_mode="full",
-        label="ctrl: len=20, topk_length=topk (== auto at len<72)")))
+            s_kv=L, topk=L,
+            label=f"short-prompt ctx={L}: effective attend count {L} (<72)")))
 
     # d1 green-island counterpart: short context but a LARGE topk row that the
     # deployment never has for short prompts; shows the difference is the
     # *effective* count, not the row width.
     cases.append(("d1_short_ctx_none", _case(
-        s_kv=128, topk=128, label="ctx=128 -> swa clamp 128 (island, topk=128 row)")))
+        s_kv=128, topk=128, label="ctx=128 (island: effective 128 >= 72)")))
+
+    # ---- d8: PARTIAL index row -- the deployment's real shape --------------- #
+    # A real short prompt keeps a ``topk = index_topk = 512``-wide index row but
+    # only min(ctx, SWA_WINDOW) of it is live.  This is the aspect d1 does not
+    # reach (there topk == s_kv), and the one the mega path's
+    # ``min(seq_len, SWA_WINDOW)`` actually produces: a WIDE row that is mostly
+    # dead.  ``topk_length_mode="auto"`` keeps eff < topk here, so the runner
+    # really does pass a partial ``topk_length``.
+    for L in (5, 20, 40):
+        cases.append(("d8_partial_row", _case(
+            s_kv=L, topk=DEPLOY_INDEX_TOPK,
+            label=f"partial row: s_kv={L}, topk=512, topk_length={L} "
+                  f"(mega shape, effective {L}<72)")))
+    # the green-island counterpart of the same aspect: eff = 128 < topk = 512
+    cases.append(("d8_partial_row", _case(
+        s_kv=512, topk=DEPLOY_INDEX_TOPK,
+        label="partial row: s_kv=512, topk=512 -> eff 128 (island)")))
 
     # ---- d2: topk=512, the deployment's index_topk (never tested) --------- #
     cases.append(("d2_topk512", _case(
@@ -297,7 +320,8 @@ def build_cases(args):
         label="sink=finite random (no +/-inf)")))
     cases.append(("d6_attn_sink", _case(
         s_kv=20, topk=20, sink_mode="inf",
-        label="sink=all +/-inf (extreme)")))
+        label="sink=all +inf (DEGENERATE: both arms output 0 -> trivially green, "
+              "carries no evidence)")))
 
     # ---- d7: explicit enable_q_norm toggle (not a deploy difference) ------- #
     # eps must match the official module's global (test-...-cast.py:168 sets
@@ -359,12 +383,19 @@ def case_tag(c) -> str:
 
 
 def classify(c) -> str:
-    """Deployment-region label, from the effective attend count.
+    """Deployment-region label -- the FULL S51 predicate, both edges.
 
-    This is the S52 question in one line: an effective count below 72 lands in
-    defect E's region; otherwise in the green island.
+    S51 measured defect E as ``topk < 72 OR b*s_q >= 6`` (green island =
+    ``topk >= 72 AND b*s_q <= 5``).  An earlier version of this script kept only
+    the topk edge, which mislabelled the deployment-topk cases that fail on the
+    b*s_q edge (e.g. b=2, s_q=3, topk=512) as "island".  Both edges are applied
+    here so the region label matches the criterion the reading is judged by.
     """
-    return "E-region" if effective_topk_length(c) < DEFECT_E_MIN_GREEN_TOPK else "island"
+    if effective_topk_length(c) < DEFECT_E_MIN_GREEN_TOPK:
+        return "E-region"
+    if c["b"] * c["s_q"] > DEFECT_E_MAX_GREEN_BS:
+        return "E-region"
+    return "island"
 
 
 # --------------------------------------------------------------------------- #
@@ -626,7 +657,9 @@ def main() -> int:
           f"(determinism rerun {'ON' if not args.no_verify_determinism else 'OFF'})")
     print("=" * 110)
 
-    agg = {"island": [0, 0], "E-region": [0, 0]}
+    # [pass, total, crashed] -- crashed is tracked separately so the printed
+    # denominator never mixes a wheel assert with a numeric verdict (review item 7).
+    agg = {"island": [0, 0, 0], "E-region": [0, 0, 0]}
     per_dim = {}
     determinism_failures = 0
     crashed_cases = 0
@@ -653,8 +686,8 @@ def main() -> int:
             crashed_cases += 1
             print(f"    CRASH: {type(e).__name__}: {e}")
             traceback.print_exc()
-            agg[region][1] += 1
-            per_dim.setdefault(dim, [0, 0])[1] += 1
+            agg[region][2] += 1
+            per_dim.setdefault(dim, [0, 0, 0])[2] += 1
             continue
 
         if m["fp8_error"] is not None:
@@ -664,7 +697,7 @@ def main() -> int:
 
         agg[region][1] += 1
         agg[region][0] += int(m["arm_ok"])
-        d = per_dim.setdefault(dim, [0, 0])
+        d = per_dim.setdefault(dim, [0, 0, 0])
         d[1] += 1
         d[0] += int(m["arm_ok"])
         rows.append((dim, region, c, m))
@@ -687,14 +720,17 @@ def main() -> int:
           f"{determinism_failures} nondeterministic)")
 
     cal_tot = sum(1 for r in rows if r[3]["cal_out_ok"] and r[3]["cal_lse_ok"])
-    print(f"  cal                 : {cal_tot}/{len(rows)} PASS (bf16 arm vs official ref)")
+    print(f"  cal                 : {cal_tot}/{len(rows)} PASS (bf16 arm vs official ref; "
+          f"CRASH cells excluded -- they never reach calibration)")
     for region in ("island", "E-region"):
-        p_, t_ = agg[region]
-        print(f"  {region:19s}: {p_}/{t_} PASS")
+        p_, t_, cr_ = agg[region]
+        extra = f"  (+{cr_} CRASH, excluded from the denominator)" if cr_ else ""
+        print(f"  {region:19s}: {p_}/{t_} PASS{extra}")
     print("  by dimension:")
     for dim in sorted(per_dim):
-        p_, t_ = per_dim[dim]
-        print(f"    {dim:22s}: {p_}/{t_} PASS")
+        p_, t_, cr_ = per_dim[dim]
+        extra = f"  (+{cr_} CRASH)" if cr_ else ""
+        print(f"    {dim:22s}: {p_}/{t_} PASS{extra}")
 
     if determinism_failures:
         print(f"\n  !! {determinism_failures} cases produced NON-DETERMINISTIC output; "
@@ -709,17 +745,28 @@ def main() -> int:
         print("  reference).  Do NOT read anything into the other groups until fixed.")
         return 1
 
-    e_p, e_t = agg["E-region"]
-    i_p, i_t = agg["island"]
+    e_p, e_t, _ = agg["E-region"]
+    i_p, i_t, _ = agg["island"]
+    # Distinguish a real numeric divergence from a crash and from the degenerate
+    # all-inf-sink cell (both arms bitwise zero).  Counting either as a
+    # "diverging cell" would overstate the result.
+    e_crash = agg["E-region"][2]
+    trivial = sum(1 for _, reg, c, m in rows
+                  if reg == "E-region" and c["sink_mode"] == "inf"
+                  and m["fp8_error"] is None and m["arm_ok"])
+    e_fail = e_t - e_p
+    e_numeric = e_fail - trivial
     print()
-    if e_t and e_p < e_t:
-        print(f"  DEPLOYMENT SHAPE REPRODUCES A DIVERGENCE: {e_t - e_p}/{e_t} E-region cells")
+    print(f"  E-region breakdown: {e_t} judged cells = {e_p} PASS "
+          f"({trivial} of them the degenerate all-inf-sink cell) "
+          f"+ {e_numeric} numeric FAIL; {e_crash} CRASH excluded")
+    if e_numeric > 0:
+        print(f"  DEPLOYMENT SHAPE REPRODUCES A DIVERGENCE: {e_numeric} E-region cells")
         print("  (effective attend count < 72, i.e. the real short-prompt workload) have the")
-        print("  fp8 arm diverging from the bf16 arm.  Per S52 this is the end-to-end落点.")
+        print("  fp8 arm diverging NUMERICALLY from the bf16 arm, O broken while lse stays")
+        print("  intact -- defect E's signature.  Per S52 this is the end-to-end landing zone.")
     elif e_t:
-        print(f"  E-region cells are GREEN ({e_p}/{e_t}) on this wheel.  The short-prompt")
-        print("  workload does NOT reproduce a divergence here -- see report section on")
-        print("  the still-uncovered differences.")
+        print(f"  E-region cells show no numeric divergence ({e_p}/{e_t} PASS).")
     if i_t:
         print(f"  island cells: {i_p}/{i_t} PASS")
     return 0
