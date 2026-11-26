@@ -170,13 +170,29 @@ __device__ __forceinline__ float fp4_e2m1_to_float(uint8_t code) {
     return __uint_as_float(uint32_t(fp4_e2m1_to_bf16_bits(code)) << 16);
 }
 
+// V523-S50: pack two floats into one e4m3x2 word with the hardware cvt --
+// the same instruction the fused output cast uses (fp8_pair_from_float in
+// fused_v41_splitkv.cuh; duplicated here because that helper lives in a
+// different namespace).  cutlass::float_e4m3_t::from_float lowers to a
+// software sequence on this toolchain and cost 1.17x-1.55x on the
+// extra-heavy small-batch shapes (measured, V523-S50 bench round s50fix2).
+__device__ __forceinline__ uint32_t fp8x2_from_float(float lo, float hi) {
+    uint16_t r;
+    asm volatile("ppu.cvt.rtte.satfinite.e4m3x2.f32 %0, %1, %2;"
+        : "=h"(r) : "f"(hi), "f"(lo));
+    return uint32_t(r);
+}
+
 // V523-S50: E4M3 twin of fp4x16_to_bf16 for the fp8-compute arm.  The extra
 // FP4 pool must be staged as E4M3 (the QK^T MMA and V-direct both consume E4M3
 // out of the K staging), with the FP4 block scale folded into the E4M3 value
 // -- the same semantics the regular V41 blocks get from
 // KVCacheG2SFP8::scale_fp8_inplace.  Fragment element j of the 16-value tile
 // holds nibble j of `packed` (the packing fp4x16_to_bf16 relies on), so word m
-// of the recast fragment covers nibbles 4m..4m+3 = bits 16m..16m+15.
+// of the recast fragment covers nibbles 4m..4m+3 = bits 16m..16m+15.  Values
+// are converted in pairs through the hardware satfinite cvt (RTNE, saturating
+// -- identical to from_float for every in-range product, which is all the FP4
+// pool can produce: the quantizer normalizes by amax/6 before packing).
 template <typename Tensor0>
 __device__ __forceinline__ void fp4x16_to_e4m3(
         uint64_t packed, Tensor0 dst, float scale) {
@@ -186,10 +202,10 @@ __device__ __forceinline__ void fp4x16_to_e4m3(
         const uint32_t nibs = uint32_t(packed >> (16 * m));
         uint32_t out = 0;
         #pragma unroll
-        for (int j = 0; j < 4; ++j) {
-            const float v = fp4_e2m1_to_float(uint8_t(nibs >> (4 * j)));
-            const cutlass::float_e4m3_t e = cutlass::float_e4m3_t::from_float(v * scale);
-            out |= uint32_t(e.storage) << (8 * j);
+        for (int j = 0; j < 4; j += 2) {
+            const float v0 = fp4_e2m1_to_float(uint8_t(nibs >> (4 * j))) * scale;
+            const float v1 = fp4_e2m1_to_float(uint8_t(nibs >> (4 * j + 4))) * scale;
+            out |= fp8x2_from_float(v0, v1) << (8 * j);
         }
         p32[m] = out;
     }
