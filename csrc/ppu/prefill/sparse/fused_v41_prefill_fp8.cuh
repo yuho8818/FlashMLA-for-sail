@@ -173,19 +173,39 @@ fused_norm_rope_attn_rope_cast_prefill_fp8_kernel(
     Tensor dP = thP.retile_D(rP);
 
     // ---- fused Q prologue: load BF16, (norm), RoPE, quantize to E4M3 ----
-    // Granule loop mirrors the sparse FP8 prefill kernel's Q staging exactly
-    // (i-strided: granule i = (row = i/32, g = i%32), one 16-dim granule per
-    // iteration).  The optional RMS norm runs as a first pass over the same
-    // loop (gmem re-read; one-time per CTA).
+    //
+    // Q ARRIVES IN THE permute_q_b_proj LAYOUT (csrc/ppu/sparse/
+    // fused_v41_projection.cu:11), exactly like the BF16 five-in-one: the
+    // caller's Q projection uses the permuted weight, so buffer position
+    // (h1, d1) of the [s_q, 64, 512] view holds natural element (h0, d0) with
+    //
+    //     h1 = (d0 / 16) * 2 + h0 / 32        d1 = (h0 % 32) * 16 + d0 % 16
+    //
+    // (inverse: h0 = (h1 % 2) * 32 + d1 / 16, d0 = (h1 / 2) * 16 + d1 % 16).
+    //
+    // The BF16 five-in-one resolves the same contract, and so must this
+    // prologue: the per-row RMS norm, the RoPE pairing and the head a score
+    // belongs to are all *natural* (h0, d0) quantities.  Reading the view
+    // coordinates as if they were logical silently shuffles heads (a one-hot
+    // on natural dim 16 shows up on head 2) and drops RoPE dims out of the
+    // rotated window.  The fix is a granule permutation: a logical 16-dim
+    // granule (h0, g) is one *contiguous* 16-dim span in the permuted buffer at
+    // view row (g*2 + h0/32), columns [(h0%32)*16, +16), so the staging keeps
+    // its 16-byte granularity and only the source address changes.
     {
         const __ppu_bfloat16_raw *gQ = reinterpret_cast<const __ppu_bfloat16_raw *>(gQRaw)
             + (long)q_token * q_stride;
         const int position = __ldg(gTokenPositions + q_token);
         const float *rope = gCosSinCache + (long)position * 64;
         if constexpr (EnableNorm) {
+            // First pass: row sums of squares, read through the same permuted
+            // addressing so the norm sees the logical row.
             for (int i = tid; i < BM * 32; i += NTHR) {
                 const int r = i / 32, g = i % 32;
-                const uint4 *src = reinterpret_cast<const uint4 *>(gQ + (long)r * 512 + g * 16);
+                const int vsrc_row = g * 2 + r / 32;
+                const int vsrc_col = (r % 32) * 16;
+                const uint4 *src =
+                    reinterpret_cast<const uint4 *>(gQ + (long)vsrc_row * 512 + vsrc_col);
                 const uint4 lo = src[0], hi = src[1];
                 const auto *e = reinterpret_cast<const cutlass::bfloat16_t *>(&lo);
                 const auto *e2 = reinterpret_cast<const cutlass::bfloat16_t *>(&hi);
@@ -195,7 +215,7 @@ fused_norm_rope_attn_rope_cast_prefill_fp8_kernel(
                     sumsq = fmaf(float(e[j]), float(e[j]), sumsq);
                     sumsq = fmaf(float(e2[j]), float(e2[j]), sumsq);
                 }
-                sNormPartial[i] = sumsq;  // 32 granule partials per row
+                sNormPartial[i] = sumsq;  // 32 granule partials per logical row
             }
             __syncthreads();
             if (tid < BM) {
@@ -206,16 +226,17 @@ fused_norm_rope_attn_rope_cast_prefill_fp8_kernel(
             }
             __syncthreads();
         }
-        // Segment walk mirrors the KV gather's addressing exactly: eight lanes
-        // cover a whole 128-dim segment of one row, and every 16-dim granule is
-        // written through the swizzled layout at (row, col).
-        constexpr int Q_LANES = 8;
-        constexpr int Q_SEGW = Q_LANES * 16;      // 128 dims per segment
-        constexpr int Q_SEGS = 512 / Q_SEGW;      // four segments per row
-        const int qrow = tid / Q_LANES, qlane = tid % Q_LANES, qcol0 = qlane * 16;
-        for (int s = 0; s < Q_SEGS; ++s) {
-            const int col = qcol0 + s * Q_SEGW;
-            const uint4 *src = reinterpret_cast<const uint4 *>(gQ + (long)qrow * 512 + col);
+        // Second pass: one 16-dim logical granule per thread iteration.  The
+        // source granule is contiguous in the permuted buffer, the destination
+        // is the swizzled natural (h0, g*16) slot, and RoPE is keyed on the
+        // *logical* column so dims [448, 512) are the ones rotated.
+        const int qg = tid % 32;
+        for (int qrow = tid / 32; qrow < BM; qrow += NTHR / 32) {
+            const int col = qg * 16;
+            const int vsrc_row = qg * 2 + qrow / 32;
+            const int vsrc_col = (qrow % 32) * 16;
+            const uint4 *src =
+                reinterpret_cast<const uint4 *>(gQ + (long)vsrc_row * 512 + vsrc_col);
             const uint4 lo = src[0], hi = src[1];
             const auto *e = reinterpret_cast<const cutlass::bfloat16_t *>(&lo);
             const auto *e2 = reinterpret_cast<const cutlass::bfloat16_t *>(&hi);
@@ -228,7 +249,7 @@ fused_norm_rope_attn_rope_cast_prefill_fp8_kernel(
             const float qnorm = EnableNorm ? sNorm[qrow] : 1.f;
             CUTLASS_PRAGMA_UNROLL
             for (int j = 0; j < 16; ++j) x[j] *= qnorm;
-            if (col >= 448) {  // rope dims [448, 512): rotate before quantizing
+            if (col >= 448) {  // rope dims [448, 512) of the LOGICAL column
                 CUTLASS_PRAGMA_UNROLL
                 for (int j = 0; j < 16; j += 2) {
                     const int pair = (col + j - 448) / 2;
