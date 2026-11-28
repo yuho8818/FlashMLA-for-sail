@@ -76,6 +76,7 @@ constexpr size_t fused_fp8_prefill_smem() {
     constexpr size_t kP = size_t(BM) * FUSED_BN;
     constexpr size_t kIdx = size_t(MaxTopk) * 4;
     constexpr size_t kFloats = 12 * size_t(BM) + 16 * (BM / 8) + (BM / 8) + 4
+        + size_t(BM)  // sRunMaxExact: true scaled max for max_logits/lse
         + (EnableNorm ? size_t(BM) * 33 : 0);
     return kQ + kK + kP + kIdx + kFloats * 4;
 }
@@ -122,7 +123,8 @@ fused_norm_rope_attn_rope_cast_prefill_fp8_kernel(
     float *sGroupScale = sGroupAmax + 16 * (BM / 8);
     int *sFlag = reinterpret_cast<int *>(sGroupScale + (BM / 8));
     float *sNorm = sGroupScale + (BM / 8) + 4;  // one slot for sFlag, 3 padding
-    float *sNormPartial = sNorm + BM;
+    float *sRunMaxExact = sNorm + (EnableNorm ? BM : 0);
+    float *sNormPartial = sRunMaxExact + BM;
 
     const int tid = threadIdx.x, wp = tid / 32, lane = tid % 32;
     const int q_token = blockIdx.x;
@@ -274,6 +276,7 @@ fused_norm_rope_attn_rope_cast_prefill_fp8_kernel(
     }
     if (tid < BM) {
         sRunMax[tid] = NEG_INF;
+        sRunMaxExact[tid] = NEG_INF;
         sRunSum[tid] = 0.f;
     }
     const int *gIdxRow = gIdx + (long)q_token * idx_stride;
@@ -380,13 +383,28 @@ fused_norm_rope_attn_rope_cast_prefill_fp8_kernel(
         }
         __syncthreads();
         if (tid < BM) {
-            // Exact running max (no ceil quantization): the fused contract's
-            // max_logits tolerance is 1e-5 against the true scaled maximum.
             float m = fmaxf(sPmax[tid], sPmax[BM + tid]);
             m = fmaxf(m, fmaxf(sPmax[2 * BM + tid], sPmax[3 * BM + tid]));
             m *= sm_scale_log2;
             float mprev = sRunMax[tid];
-            float mnew = fmaxf(mprev, m);
+            // Two maxima, deliberately:
+            //   * sRunMaxExact carries the true scaled maximum, because the
+            //     fused contract publishes max_logits/lse against it (tolerance
+            //     1e-5) -- quantizing it to exp2 steps would break that.
+            //   * sRunMax (the one the probability path uses as its bias) is
+            //     ceil-quantized to whole exp2 steps, like the validated sparse
+            //     prefill kernel's update_running_max.  That rounding is not
+            //     cosmetic: quantize_probability forms
+            //     exp2(fma(score, scale_log2, LOG2_P_SCALE - mxs)) and relies on
+            //     mxs >= the true scaled maximum so the result stays inside
+            //     E4M3's 448.  With the exact max, lanes whose reduction
+            //     undershoots let P exceed 448 and saturate, which corrupts
+            //     sRunSum and collapses the output as P becomes peaked
+            //     (measured: cos 0.9997 at uniform P -> 0.09 at q_amp 0.3 while
+            //     the validated sparse q8 kernel holds 0.999 throughout).
+            const float mq = ceilf(m);
+            sRunMaxExact[tid] = fmaxf(sRunMaxExact[tid], m);
+            float mnew = fmaxf(mprev, mq);
             sRunMax[tid] = mnew;
             float sc = (mprev == NEG_INF) ? 1.f : exp2f(mprev - mnew);
             sScale[tid] = sc;
@@ -416,7 +434,10 @@ fused_norm_rope_attn_rope_cast_prefill_fp8_kernel(
 
     // ---- per-row epilogue scalars (natural-log domain, sink-aware) ----
     if (tid < BM) {
-        const float m = sRunMax[tid];
+        // The published statistics use the TRUE scaled maximum (sRunMaxExact);
+        // sRunMax is the ceil-quantized one the probability bias needs.  For a
+        // single tile they coincide, which is the common case.
+        const float m = sRunMaxExact[tid] > NEG_INF ? sRunMaxExact[tid] : sRunMax[tid];
         const float s = sRunSum[tid];
         const bool empty = !(s > 0.f);
         if (gMaxLogits)
