@@ -26,6 +26,7 @@ def prefill(
     d_v: int = 512,
     attn_sink: Optional[torch.Tensor] = None,
     topk_length: Optional[torch.Tensor] = None,
+    fp8_compute: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     A fused kernel for Q Norm + Q RoPE + Core Attn (sparse attention) + O RoPE + O cast to FP8, for DeepSeek-V4.1
@@ -61,6 +62,11 @@ def prefill(
             +-inf in attn_sink will be handled normally (i.e., -inf has no effect, +inf will make corresponding output all zeros). This has no effect on lse and max_logits.
         topk_length: optional, [s_q], int32. If provided, the i-th q token will only attend to k tokens specified by indices[i, :, :topk_length[i]], ignoring later k tokens (even if provided in indices). This parameter is mainly used for variable-length topk attention scenarios, such as using sparse attention to simulate causal attention.
             In extremely rare cases (topk_length provided, there is a valid topk index between topk_length[i] ~ s_kv, and that topk index points to a k token containing NaN), operator output will contain NaN, so please avoid this situation.
+        fp8_compute: bool. Run the five-in-one's GEMMs on the PPU1.5
+            E4M3xE4M3->F32 atom instead of the BF16 atom (Q is quantized to
+            E4M3 after RoPE; the BF16 kv workspace is quantized to E4M3 inside
+            the call, the same deployment cost flash_mla_sparse_quantized_fwd
+            pays).  H64 with per-token FP32 scales only; off by default.
 
     Returns:
         - out_fp8: [s_q, n_wv_group, wv_group_size * d_v], fp8_e4m3, quantized attention result (wv_group_size = h_q / n_wv_group)
@@ -74,7 +80,8 @@ def prefill(
 
         enable_q_norm, rms_norm_eps, token_positions, is_rope_neox_style, rope_dim, cos_sin_cache,
 
-        n_wv_group, num_per_channels, use_tma_aligned_col_major_sf, round_sf, use_packed_ue8m0
+        n_wv_group, num_per_channels, use_tma_aligned_col_major_sf, round_sf, use_packed_ue8m0,
+        fp8_compute,
     )
     out_fp8, out_sf, max_logits, lse = results
     return out_fp8, out_sf, max_logits, lse

@@ -62,6 +62,12 @@ void run_fused_norm_rope_attn_rope_cast_fwd_kernel(const Params& params);
 template<bool EnableNorm>
 void run_fused_norm_rope_attn_rope_cast_prefill_hs64(const Params& params);
 
+// FP8-compute variant of the prefill five-in-one (E4M3 QK^T and PV on the
+// PPU1.5 atom; Q is quantized to E4M3 after RoPE and the kv pointer addresses
+// the API-quantized E4M3 workspace).  Same Params contract as the BF16 entry.
+template<bool EnableNorm>
+void run_fused_norm_rope_attn_rope_cast_prefill_hs64_fp8(const Params& params);
+
 template<bool EnableNorm>
 void run_fused_norm_rope_attn_rope_cast_prefill_h128(const Params& params);
 

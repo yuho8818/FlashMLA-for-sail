@@ -31,6 +31,7 @@ def get_sources():
         "csrc/ppu/decode/dense/instantiations/splitkv_mla_bf16.cu",
         "csrc/ppu/prefill/sparse/instantiations/dispatch_bf16.cu",
         "csrc/ppu/prefill/sparse/instantiations/fused_v41_h64_bf16.cu",
+        "csrc/ppu/prefill/sparse/instantiations/fused_v41_h64_fp8.cu",
         "csrc/ppu/prefill/sparse/instantiations/fused_v41_h128_bf16.cu",
         "csrc/ppu/decode/sparse/instantiations/hdim576_bf16.cu",
         "csrc/ppu/decode/sparse/instantiations/hdim512_bf16.cu",

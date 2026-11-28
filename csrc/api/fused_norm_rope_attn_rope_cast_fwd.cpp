@@ -6,6 +6,9 @@
 
 void get_mla_metadata_func(Mla_metadata_params &params, hggcStream_t stream);
 void get_mla_uniform_sparse_metadata_func(Mla_metadata_params &params, hggcStream_t stream);
+// Defined in csrc/ppu/prefill/sparse/native_fp8.cu (the sparse q8 prefill's
+// workspace quantization); reused so both FP8 prefill arms pay the same cost.
+void prepare_sparse_prefill_fp8_kv(const void*, void*, int, int, int64_t, hggcStream_t);
 
 namespace flashmla::fused_norm_rope_attn_rope_cast_fwd::core_attn {
 template<bool Norm, bool ExtraFP4>
@@ -416,7 +419,7 @@ std::vector<at::Tensor> fused_norm_rope_attn_rope_cast_fwd(
     double rms_norm_eps, const at::Tensor& token_positions, bool is_rope_neox_style,
     int64_t rope_dim, const at::Tensor& cos_sin_cache, int64_t n_wv_group,
     int64_t num_per_channels, bool use_tma_aligned_col_major_sf,
-    bool round_sf, bool use_packed_ue8m0) {
+    bool round_sf, bool use_packed_ue8m0, bool fp8_compute) {
     KU_CHECK_DEVICE(q);
     at::cuda::CUDAGuard guard(q.device());
     auto p = make_fused_params(q, sm_scale, d_v, attn_sink, topk_length, enable_q_norm,
@@ -453,6 +456,34 @@ std::vector<at::Tensor> fused_norm_rope_attn_rope_cast_fwd(
     p.stride_out_sf_token = out_sf.stride(0);
     p.stride_out_sf_group = out_sf.stride(1);
     p.stride_out_sf_word = out_sf.stride(2);
+    // Select the FP8-compute five-in-one.  Only the H64 per-token-scale prefill
+    // path has an FP8 instantiation; the entry re-checks that, so a stray flag
+    // cannot silently change kernels on a path that has no FP8 variant (the
+    // decode five-in-one's fp8_compute contract).
+    if (fp8_compute) {
+        TORCH_CHECK(p.h_q == 64,
+                    "fp8_compute requires the H64 five-in-one prefill path");
+        TORCH_CHECK(p.per_token_scale,
+                    "fp8_compute requires per-token FP32 output scales (num_per_channels=4096)");
+        // Quantize the BF16 workspace to E4M3 once (saturating round-to-nearest
+        // pair packing, the same kernel the sparse q8 prefill arm uses).  This
+        // is the deployment-real input-adaptation cost and stays inside the
+        // timed call; both GEMMs then consume E4M3 directly.
+        at::Tensor kv_fp8 = torch::empty({p.s_kv, 1, 512},
+                                         q.options().dtype(torch::kFloat8_e4m3fn));
+        if (p.s_kv > 0 && p.s_q > 0) {
+            prepare_sparse_prefill_fp8_kv(kv.data_ptr(), kv_fp8.data_ptr(), p.s_kv, 512,
+                                          kv.stride(0), p.stream);
+        }
+        p.kv = kv_fp8.data_ptr();
+        p.stride_kv_s_kv = kv_fp8.stride(0);
+        if (p.enable_q_norm) {
+            fused::core_attn::run_fused_norm_rope_attn_rope_cast_prefill_hs64_fp8<true>(p);
+        } else {
+            fused::core_attn::run_fused_norm_rope_attn_rope_cast_prefill_hs64_fp8<false>(p);
+        }
+        return {out_fp8, out_sf, max_logits, lse};
+    }
     if (p.h_q == 8) {
         if (p.enable_q_norm) fused::core_attn::run_fused_norm_rope_attn_rope_cast_prefill_small<true>(p);
         else fused::core_attn::run_fused_norm_rope_attn_rope_cast_prefill_small<false>(p);
