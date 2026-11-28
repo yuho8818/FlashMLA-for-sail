@@ -5966,6 +5966,9 @@ __forceinline__ __device__ void hs64_attention(
         T::kHeadDim == 512 &&
         params.topk == 2048 && params.topk_len_ptr == nullptr &&
         params.extra_topk < 0;
+    // [S63-A3] Switch for the trailing-barrier experiment (see the loop tail).
+    // false = unchanged behaviour.
+    constexpr bool kS63DropTailBarrier = true;
 
     const int batch_step = kWorklist<T> == Hs64Worklist::Single ? 1 : int(gridDim.z);
 #pragma unroll 1
@@ -7219,8 +7222,21 @@ __forceinline__ __device__ void hs64_attention(
                 // PPU stream serialization orders the following combine launch.
             }
         }
-        if (next_batch_idx <= end_idx)
-            __syncthreads();
+        // [S63-A3] The trailing CTA barrier is redundant with the one above.
+        //
+        // Between the mbarrier-reinit barrier and this point the only work
+        // issued is `launch_q_copy`, an async (AIU) copy that signals
+        // `barrier_Q` when it lands. The next iteration's first reader of sQ is
+        // gated on that mbarrier (`test_wait(barrier_Q, ...)`), not on a CTA
+        // barrier, and the current query's sQ consumers (the QK GEMMs) have
+        // already retired before the mbarrier-reinit barrier. So this barrier
+        // appears to order against nothing the previous barrier does not
+        // already order. Kept behind a switch so the A/B pair differs by
+        // exactly this one barrier.
+        if constexpr (!kS63DropTailBarrier) {
+            if (next_batch_idx <= end_idx)
+                __syncthreads();
+        }
     }
 }
 
