@@ -93,7 +93,7 @@ fused_norm_rope_attn_rope_cast_prefill_fp8_kernel(
     float *__restrict__ gMaxLogits,         // [s_q, h_q]
     float *__restrict__ gLse,                // [s_q, h_q]
     float sm_scale_log2, float rms_norm_eps, int topk, int s_kv, int n_wv_group,
-    int64_t q_stride, int64_t idx_stride, uint8_t *__restrict__ dbg_q_dump) {
+    int64_t q_stride, int64_t idx_stride) {
     using Traits = FusedFp8PrefillTraits<BM, MaxTopk>;
     constexpr int NTHR = Traits::Threads, QK_THREADS = Traits::QKThreads;
     constexpr int BN = FUSED_BN, DV = FUSED_DV;
@@ -202,9 +202,16 @@ fused_norm_rope_attn_rope_cast_prefill_fp8_kernel(
             }
             __syncthreads();
         }
-        for (int i = tid; i < BM * 32; i += NTHR) {
-            const int r = i / 32, g = i % 32;
-            const uint4 *src = reinterpret_cast<const uint4 *>(gQ + (long)r * 512 + g * 16);
+        // Segment walk mirrors the KV gather's addressing exactly: eight lanes
+        // cover a whole 128-dim segment of one row, and every 16-dim granule is
+        // written through the swizzled layout at (row, col).
+        constexpr int Q_LANES = 8;
+        constexpr int Q_SEGW = Q_LANES * 16;      // 128 dims per segment
+        constexpr int Q_SEGS = 512 / Q_SEGW;      // four segments per row
+        const int qrow = tid / Q_LANES, qlane = tid % Q_LANES, qcol0 = qlane * 16;
+        for (int s = 0; s < Q_SEGS; ++s) {
+            const int col = qcol0 + s * Q_SEGW;
+            const uint4 *src = reinterpret_cast<const uint4 *>(gQ + (long)qrow * 512 + col);
             const uint4 lo = src[0], hi = src[1];
             const auto *e = reinterpret_cast<const cutlass::bfloat16_t *>(&lo);
             const auto *e2 = reinterpret_cast<const cutlass::bfloat16_t *>(&hi);
@@ -214,13 +221,13 @@ fused_norm_rope_attn_rope_cast_prefill_fp8_kernel(
                 x[2 * j] = float(e[j]);
                 x[2 * j + 1] = float(e2[j]);
             }
-            const float qnorm = EnableNorm ? sNorm[r] : 1.f;
+            const float qnorm = EnableNorm ? sNorm[qrow] : 1.f;
             CUTLASS_PRAGMA_UNROLL
             for (int j = 0; j < 16; ++j) x[j] *= qnorm;
-            if (g >= 28) {  // rope dims [448, 512): rotate before quantizing
+            if (col >= 448) {  // rope dims [448, 512): rotate before quantizing
                 CUTLASS_PRAGMA_UNROLL
                 for (int j = 0; j < 16; j += 2) {
-                    const int pair = (g * 16 + j - 448) / 2;
+                    const int pair = (col + j - 448) / 2;
                     const float2 rotated = fused_apply_rope(float2{x[j], x[j + 1]},
                         __ldg(rope + pair), __ldg(rope + 32 + pair));
                     x[j] = rotated.x;
@@ -228,25 +235,16 @@ fused_norm_rope_attn_rope_cast_prefill_fp8_kernel(
                 }
             }
             // Scalar E4M3 conversion + 8-code (8-byte) stores, the same
-            // granularity the decode five-in-one's FP8 loader uses, so the Q
-            // path never depends on the pair converter's byte order.
+            // granularity the decode five-in-one's FP8 loader uses.
             CUTLASS_PRAGMA_UNROLL
             for (int h = 0; h < 2; ++h) {
                 alignas(16) cutlass::float_e4m3_t codes[8];
                 CUTLASS_PRAGMA_UNROLL
                 for (int j = 0; j < 8; ++j)
                     codes[j] = cutlass::float_e4m3_t::from_float(x[h * 8 + j]);
-                *reinterpret_cast<uint2 *>(&sQt(r, g * 16 + h * 8)) =
+                *reinterpret_cast<uint2 *>(&sQt(qrow, col + h * 8)) =
                     *reinterpret_cast<const uint2 *>(codes);
             }
-        }
-    }
-    if (dbg_q_dump != nullptr) {
-        // Diagnostic (V523-S61): dump the staged Q tile verbatim so the smem
-        // layout can be compared against the host-side expectation.
-        for (int i = tid; i < BM * 512; i += NTHR) {
-            const int r = i / 512, c = i % 512;
-            dbg_q_dump[(long)q_token * (BM * 512) + i] = (uint8_t)sQt(r, c);
         }
     }
     if (tid < BM) {
@@ -467,8 +465,7 @@ void launch_fused_prefill_fp8(
     const void *q, const void *kv, const int *idx, const int *lengths, const float *sink,
     const int *token_positions, const float *cos_sin_cache, uint8_t *out_fp8, float *out_sf,
     float *max_logits, float *lse, float sm_scale_log2, float rms_norm_eps, int topk, int s_kv,
-    int s_q, int n_wv_group, int64_t q_stride, int64_t idx_stride, uint8_t *dbg_q_dump,
-    hggcStream_t stream) {
+    int s_q, int n_wv_group, int64_t q_stride, int64_t idx_stride, hggcStream_t stream) {
     constexpr int NTHR = FusedFp8PrefillTraits<BM, MaxTopk>::Threads;
     constexpr size_t smem = fused_fp8_prefill_smem<BM, MaxTopk, EnableNorm>();
     static_assert(smem <= 256 * 1024);
@@ -477,7 +474,7 @@ void launch_fused_prefill_fp8(
     kernel<<<dim3(s_q, 1), NTHR, smem, stream>>>(
         q, reinterpret_cast<const E4M3 *>(kv), idx, lengths, sink, token_positions, cos_sin_cache,
         out_fp8, out_sf, max_logits, lse, sm_scale_log2, rms_norm_eps, topk, s_kv, n_wv_group,
-        q_stride, idx_stride, dbg_q_dump);
+        q_stride, idx_stride);
     CHECK_CUDA_KERNEL_LAUNCH();
 }
 
