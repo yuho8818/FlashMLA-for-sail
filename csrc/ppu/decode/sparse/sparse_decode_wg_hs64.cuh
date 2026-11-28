@@ -5966,6 +5966,20 @@ __forceinline__ __device__ void hs64_attention(
         T::kHeadDim == 512 &&
         params.topk == 2048 && params.topk_len_ptr == nullptr &&
         params.extra_topk < 0;
+    // [S63-A2] Direct-path counterpart of the prefill lookahead above.
+    //
+    // The prefill gate is deliberately narrow (topk==2048 && no length ptr &&
+    // no extra cache); the deployed decode shape (topk=128 + extra=512) matches
+    // none of it, so the direct path gets no next-K lookahead and its prolog K
+    // load sits on the critical path.
+    //
+    // Unlike the prefill case the direct path always has per-row lengths and a
+    // second cache, so the guard has to be about the *shape of this row*, not
+    // about the params: we only prefetch the high half of block 0 into WG0's
+    // retired bank, which is exactly what the prolog writes to `cur_sK0`.
+    const bool next_direct_high_active = !kSkipNextKPrefetch &&
+        kHs64FusedDirectQueries<T> && T::kHeadDim == 512 &&
+        !T::kIsPrefill && ALLOW_EXTRA;
 
     const int batch_step = kWorklist<T> == Hs64Worklist::Single ? 1 : int(gridDim.z);
 #pragma unroll 1
@@ -6223,13 +6237,19 @@ __forceinline__ __device__ void hs64_attention(
                             pre_token_idx0, start_block_idx + 2,
                             end_block_idx, extra_seqlen_k);
                     } else {
-                        load_K_tiles_bf16<
-                            T::kStage1KTiles, 8, true, T, false, T::kUseEvenHighBank>(
-                            params, cur_sK0, batch_idx, start_block_idx,
-                            seqlen_k, &barriers_K0[1], idx_in_warpgroup,
-                            ori_block_max, smem_valid_indices, prolog_vi_wg0,
-                            pre_token_idx0, start_block_idx + 2,
-                            end_block_idx, extra_seqlen_k);
+                        // [S63-A2] When the epilogue already staged this block's
+                        // high half into the retired bank, skip the duplicate
+                        // load here -- that is the whole point of the lookahead
+                        // (and re-loading would also race the in-flight copy).
+                        if (batch_idx == begin_idx || !next_direct_high_active) {
+                            load_K_tiles_bf16<
+                                T::kStage1KTiles, 8, true, T, false, T::kUseEvenHighBank>(
+                                params, cur_sK0, batch_idx, start_block_idx,
+                                seqlen_k, &barriers_K0[1], idx_in_warpgroup,
+                                ori_block_max, smem_valid_indices, prolog_vi_wg0,
+                                pre_token_idx0, start_block_idx + 2,
+                                end_block_idx, extra_seqlen_k);
+                        }
                         load_K_tiles_bf16<0, T::kStage1KTiles, true, T, true, true>(
                             params, cur_sK0, batch_idx, start_block_idx,
                             seqlen_k, &barriers_K0[0], idx_in_warpgroup,
@@ -6919,6 +6939,11 @@ __forceinline__ __device__ void hs64_attention(
         // no buffer ownership change, and no arithmetic reorder -- the values
         // loaded are discarded. Correctness is therefore bit-identical by
         // construction (see evidence/lb1_prereg.md 3.4).
+        //
+        // MEASURED OUTCOME (S63 LB-3): no effect. duration 208.76->207.95us (-0.39%),
+        // memory_dependency 0.3672->0.3678 (+0.0006), issue_active -0.09%. The stall
+        // is NOT index-lookup latency: L2 hit is already 72.2% and the prolog
+        // re-issues the same __ldg anyway. Kept as a bit-identical, zero-cost stage.
         if constexpr (kStageOutputInRetiredK && !T::kIsPrefill) {
             if (next_batch_idx <= end_idx) {
                 // Mirror the prolog's own per-warpgroup block split so both
@@ -6936,6 +6961,57 @@ __forceinline__ __device__ void hs64_attention(
                 // Consume so the loads are not dead-code eliminated.
                 if (scratch_idx0[0] == -2 && scratch_idx1[0] == -2)
                     sM[0] = sM[0];
+            }
+        }
+
+        // [S63-A2] Cross-query K data prefetch into the retired bank.
+        //
+        // A1 above showed the stall is not index latency, so the K *data* has to
+        // move earlier. This is the same trick the prefill-grouped path already
+        // uses (`next_wg0_high_active`, above): while the current query's
+        // epilogue runs, WG0's retired K bank is free, so the next query's
+        // high-half K tiles can be issued into it and land before the next
+        // prolog asks for them.
+        //
+        // Buffer legality: `sO_addr == sK(_,_,1)` (see kStageOutputInRetiredK
+        // static_assert), i.e. the epilogue stages output in K buffer 1. Buffer 0
+        // is therefore the free one, and for the direct path block 0's dims
+        // [256,512) are exactly what the prolog writes into `cur_sK0` via
+        // `load_K_tiles_bf16<kStage1KTiles, 8, ..., kUseEvenHighBank>`. So this
+        // reproduces the prolog's own load verbatim, just earlier.
+        //
+        // This changes *when* a tile is written, never *what* or in which order
+        // the mainloop consumes it, so the arithmetic order is unchanged.
+        if constexpr (kStageOutputInRetiredK && !T::kIsPrefill) {
+            if (next_direct_high_active && next_batch_idx <= end_idx &&
+                warpgroup_idx == 0) {
+                // Only the high half (dims [256,512)) can live in the retired
+                // bank; the low half's destination is the output-occupied bank.
+                //
+                // Address/validity must match what the next iteration's prolog
+                // will compute, or the prefetched bytes would be for the wrong
+                // tokens. Mirror the prolog's own derivation for the next row:
+                // direct starts every query at block 0, and `seqlen_k` is the
+                // clamped topk length of that row.
+                const int next_length_row =
+                    kWorklist<T> == Hs64Worklist::Flat ? next_batch_idx / params.q_orig
+                                                       : next_batch_idx;
+                int next_seqlen_k = params.topk;
+                if (params.topk_len_ptr) {
+                    next_seqlen_k = min(max(__ldg(params.topk_len_ptr + next_length_row), 0),
+                                        params.topk);
+                }
+                if (next_seqlen_k > 0) {
+                    int next_pre_idx[T::kGmemPasses] = {};
+                    next_pre_idx[0] = -1;
+                    prefetch_tok(0, next_pre_idx, next_batch_idx);
+                    load_K_tiles_bf16<
+                        T::kStage1KTiles, 8, false, T, false, T::kUseEvenHighBank>(
+                        params, cur_sK0, next_batch_idx, 0, next_seqlen_k,
+                        &barriers_K0[1], idx_in_warpgroup, -1,
+                        smem_valid_indices, 0, next_pre_idx, 2,
+                        2, 0);
+                }
             }
         }
 
