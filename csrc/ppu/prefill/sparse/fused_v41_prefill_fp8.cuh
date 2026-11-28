@@ -155,6 +155,7 @@ fused_norm_rope_attn_rope_cast_prefill_fp8_kernel(
     auto thP = tcP.get_thread_slice(tid);
 
     Tensor srcQ = thQ.partition_S(make_mix_tensor_like(sQt));
+    Tensor srcK_ = thK.partition_S(make_mix_tensor_like(sKt0));
     Tensor srcP = thP.partition_S(make_mix_tensor_like(sPt));
 
     const int qk_lbo_a = 1, qk_sbo_a = 32;
@@ -300,39 +301,24 @@ fused_norm_rope_attn_rope_cast_prefill_fp8_kernel(
         clear(acc_s);
         clear(acc_s1);
         if (tid < QK_THREADS) {
-#define QADDR(kk) (qtsm0 + ((kk) >> 1) * (BM * 4) + ((kk) & 1) * 2)
-#define KADDR(kk) (ktsm0 + ((t & 1) * kstage) + ((kk) >> 1) * 256 + ((kk) & 1) * 2)
-            PPU_LDM((uint32_t *)&rQ(0, 0, 0), QADDR(0), qk_lbo_a, qk_sbo_a);
-            PPU_LDM((uint32_t *)&rK(0, 0, 0), KADDR(0), qk_lbo_b, qk_sbo_b);
-            PPU_LDM((uint32_t *)&rQ(0, 0, 1), QADDR(1), qk_lbo_a, qk_sbo_a);
-            PPU_LDM((uint32_t *)&rK(0, 0, 1), KADDR(1), qk_lbo_b, qk_sbo_b);
-            PPU_LDM((uint32_t *)&rQ(0, 0, 2), QADDR(2), qk_lbo_a, qk_sbo_a);
-            PPU_LDM((uint32_t *)&rK(0, 0, 2), KADDR(2), qk_lbo_b, qk_sbo_b);
+            // Stream the Q/K fragments through the E4M3 copy atoms instead of
+            // the raw PPU_LDM asm: the atoms carry the swizzle mode calibrated
+            // for 1-byte operands, while a hard-coded mode aliases granules.
+            Tensor rQv = tqk.partition_fragment_A(sQt);
+            Tensor rKv = tqk.partition_fragment_B(sKt0);
+            Tensor cQ = thQ.retile_D(rQv);
+            Tensor cK = thK.retile_D(rKv);
             CUTLASS_PRAGMA_UNROLL
-            for (int k = 0; k + 2 < NK_QK; k += 3) {
-                if (k + 3 < NK_QK) {
-                    PPU_LDM((uint32_t *)&rQ(0, 0, k + 3), QADDR(k + 3), qk_lbo_a, qk_sbo_a);
-                    PPU_LDM((uint32_t *)&rK(0, 0, k + 3), KADDR(k + 3), qk_lbo_b, qk_sbo_b);
+            for (int k = 0; k < NK_QK; k += 2) {
+                cute::copy(tcQ, srcQ(_, _, k), cQ(_, _, _0{}));
+                cute::copy(tcK, srcK_(_, _, k), cK(_, _, _0{}));
+                cute::gemm(mqk, cQ(_, _, _0{}), cK(_, _, _0{}), acc_s);
+                if (k + 1 < NK_QK) {
+                    cute::copy(tcQ, srcQ(_, _, k + 1), cQ(_, _, _0{}));
+                    cute::copy(tcK, srcK_(_, _, k + 1), cK(_, _, _0{}));
+                    cute::gemm(mqk, cQ(_, _, _0{}), cK(_, _, _0{}), acc_s1);
                 }
-                if (k + 4 < NK_QK) {
-                    PPU_LDM((uint32_t *)&rQ(0, 0, k + 4), QADDR(k + 4), qk_lbo_a, qk_sbo_a);
-                    PPU_LDM((uint32_t *)&rK(0, 0, k + 4), KADDR(k + 4), qk_lbo_b, qk_sbo_b);
-                }
-                if (k + 5 < NK_QK) {
-                    PPU_LDM((uint32_t *)&rQ(0, 0, k + 5), QADDR(k + 5), qk_lbo_a, qk_sbo_a);
-                    PPU_LDM((uint32_t *)&rK(0, 0, k + 5), KADDR(k + 5), qk_lbo_b, qk_sbo_b);
-                }
-                cute::gemm(mqk, rQ(_, _, k + 0), rK(_, _, k + 0), acc_s);
-                cute::gemm(mqk, rQ(_, _, k + 1), rK(_, _, k + 1), acc_s1);
-                cute::gemm(mqk, rQ(_, _, k + 2), rK(_, _, k + 2), acc_s);
             }
-            static constexpr int K_TAIL = (NK_QK / 3) * 3;
-            if constexpr (NK_QK % 3 >= 1)
-                cute::gemm(mqk, rQ(_, _, K_TAIL), rK(_, _, K_TAIL), acc_s);
-            if constexpr (NK_QK % 3 == 2)
-                cute::gemm(mqk, rQ(_, _, K_TAIL + 1), rK(_, _, K_TAIL + 1), acc_s1);
-#undef QADDR
-#undef KADDR
             CUTLASS_PRAGMA_UNROLL
             for (int e = 0; e < 8; ++e) {
                 const int col = wn * 16 + (lane % 4) * 2 + ((e >> 2) & 1) * 8 + (e & 1);
