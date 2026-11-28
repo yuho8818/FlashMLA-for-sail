@@ -245,14 +245,7 @@ fused_norm_rope_attn_rope_cast_prefill_fp8_kernel(
                 alignas(16) cutlass::float_e4m3_t codes[8];
                 CUTLASS_PRAGMA_UNROLL
                 for (int j = 0; j < 8; ++j)
-#if FUSED_FP8_Q_NOQUANT
-                    // Diagnostic: truncate the scaled float to a byte so the
-                    // staging address is exercised without the converter.
-                    codes[j] = cutlass::float_e4m3_t::bitcast(
-                        uint8_t(int(x[h * 8 + j] * 16.0f) & 0xff));
-#else
                     codes[j] = cutlass::float_e4m3_t::from_float(x[h * 8 + j]);
-#endif
                 *reinterpret_cast<uint2 *>(&sQt(qrow, col + h * 8)) =
                     *reinterpret_cast<const uint2 *>(codes);
             }
