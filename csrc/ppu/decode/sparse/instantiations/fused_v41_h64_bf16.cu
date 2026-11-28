@@ -145,6 +145,25 @@ struct FusedHs64DirectTraits : FusedHs64Traits<false,
     static constexpr bool kDeferPrefillSink = true;
     static_assert(Base::kPrefillSinkOffset + 64 * sizeof(float) <= offsetof(SharedMemoryPlan, smem_sP));
 };
+
+// V523-S60: the direct path used to launch exactly `sm_count` CTAs, so each CTA
+// serialised ~4.3 complete queries (see lb1_analysis.md §5). At one resident CTA
+// per CU that serial chain is what leaves the issue slots empty (S58: eligible
+// 0.82/engine, issue_active 61.4%). Oversubscribing the grid gives the same
+// total work a different CTA decomposition: with G = 2*sm_count the per-CTA
+// chain halves while the CTAs still execute one-at-a-time per CU, so the tail
+// effect shrinks and the per-CU query mix stays identical (same total work,
+// same order per query). Set kDirectGridScale = 1 to restore the old behaviour.
+template<int Arch>
+inline constexpr int kFusedHs64DirectGridScale = Arch == 89 ? 2 : 1;
+
+inline int fused_hs64_direct_grid_rows(int sm_count, int rows, int arch) {
+    if (arch == 89) {
+        const int scaled = sm_count * kFusedHs64DirectGridScale<89>;
+        return rows < scaled ? rows : scaled;
+    }
+    return sm_count;
+}
 template<int Arch, bool FloatKV, bool PerTokenScale>
 static void run_fused_hs64_direct_output(const OutputParams<PerTokenScale>& p, int grid_rows) {
     using T = FusedHs64DirectTraits<Arch, FloatKV, PerTokenScale>;
@@ -186,11 +205,16 @@ static void run_fused_hs64_packed_output(const OutputParams<PerTokenScale>& p) {
 }
 
 void run_fused_norm_rope_attn_rope_cast_decode_hs64_direct(const Params& p, int grid_rows) {
+    // V523-S60: oversubscribe the grid on SM89 so each CTA owns fewer of the
+    // complete queries. The caller passes sm_count; scale it here so the kernel
+    // still derives its own row ranges from gridDim.z (hs64:5894-5903).
+    const int rows = p.s_q;
+    const int scaled_rows = fused_hs64_direct_grid_rows(grid_rows, rows, p.arch);
     if (p.arch == 89) {
         if (p.per_token_scale)
-            run_fused_hs64_direct_output<89, true>(OutputParams<true>{p}, grid_rows);
+            run_fused_hs64_direct_output<89, true>(OutputParams<true>{p}, scaled_rows);
         else
-            run_fused_hs64_direct_output<89, true>(OutputParams<false>{p}, grid_rows);
+            run_fused_hs64_direct_output<89, true>(OutputParams<false>{p}, scaled_rows);
     } else if (p.v41_float_kv) {
         run_fused_hs64_direct_output<80, true>(OutputParams<false>{p}, grid_rows);
     } else {
