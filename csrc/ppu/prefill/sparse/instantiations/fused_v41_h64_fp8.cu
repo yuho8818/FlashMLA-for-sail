@@ -19,6 +19,8 @@
 #endif
 #define ACOMPUTE_VERSION 10500
 
+#include <cstdlib>
+
 #include "api/common.h"
 #include "ppu/sparse/fused_v41.h"
 #include "ppu/prefill/sparse/fused_v41_prefill_fp8.cuh"
@@ -38,19 +40,27 @@ void run_fused_norm_rope_attn_rope_cast_prefill_hs64_fp8(const Params& p) {
     TORCH_CHECK(p.wv_group_size == 8 && p.n_wv_group == 8);
     if (p.s_q == 0) return;
     auto* out_sf = reinterpret_cast<float*>(p.out_sf);
+    // V523-S61 diagnostic: dump the staged Q tile when the env var is set.
+    uint8_t* dbg_q_dump = nullptr;
+    const char* dump_env = std::getenv("FLASHMLA_S61_QDUMP");
+    if (dump_env != nullptr && dump_env[0] != '0') {
+        dbg_q_dump = reinterpret_cast<uint8_t*>(std::strtoull(dump_env, nullptr, 16));
+    }
     constexpr int BM = 64;
     if (p.topk <= 2176) {
         fp8_prefill::launch_fused_prefill_fp8<BM, EnableNorm, 2176>(
             p.q, p.kv, p.indices, p.topk_length, p.attn_sink, p.token_positions, p.cos_sin_cache,
             p.out_fp8, out_sf, p.max_logits, p.lse, p.sm_scale_log2, p.rms_norm_eps, p.topk,
-            p.s_kv, p.s_q, p.n_wv_group, p.stride_q_s_q, p.stride_indices_s_q, p.stream);
+            p.s_kv, p.s_q, p.n_wv_group, p.stride_q_s_q, p.stride_indices_s_q, dbg_q_dump,
+            p.stream);
     } else {
         // Wide sparse rows keep the same kernel; only the index staging grows,
         // which drops the launch to one CTA per CU.
         fp8_prefill::launch_fused_prefill_fp8<BM, EnableNorm, 5312>(
             p.q, p.kv, p.indices, p.topk_length, p.attn_sink, p.token_positions, p.cos_sin_cache,
             p.out_fp8, out_sf, p.max_logits, p.lse, p.sm_scale_log2, p.rms_norm_eps, p.topk,
-            p.s_kv, p.s_q, p.n_wv_group, p.stride_q_s_q, p.stride_indices_s_q, p.stream);
+            p.s_kv, p.s_q, p.n_wv_group, p.stride_q_s_q, p.stride_indices_s_q, dbg_q_dump,
+            p.stream);
     }
 }
 

@@ -93,7 +93,7 @@ fused_norm_rope_attn_rope_cast_prefill_fp8_kernel(
     float *__restrict__ gMaxLogits,         // [s_q, h_q]
     float *__restrict__ gLse,                // [s_q, h_q]
     float sm_scale_log2, float rms_norm_eps, int topk, int s_kv, int n_wv_group,
-    int64_t q_stride, int64_t idx_stride) {
+    int64_t q_stride, int64_t idx_stride, uint8_t *__restrict__ dbg_q_dump) {
     using Traits = FusedFp8PrefillTraits<BM, MaxTopk>;
     constexpr int NTHR = Traits::Threads, QK_THREADS = Traits::QKThreads;
     constexpr int BN = FUSED_BN, DV = FUSED_DV;
@@ -239,6 +239,14 @@ fused_norm_rope_attn_rope_cast_prefill_fp8_kernel(
                 *reinterpret_cast<uint2 *>(&sQt(r, g * 16 + h * 8)) =
                     *reinterpret_cast<const uint2 *>(codes);
             }
+        }
+    }
+    if (dbg_q_dump != nullptr) {
+        // Diagnostic (V523-S61): dump the staged Q tile verbatim so the smem
+        // layout can be compared against the host-side expectation.
+        for (int i = tid; i < BM * 512; i += NTHR) {
+            const int r = i / 512, c = i % 512;
+            dbg_q_dump[(long)q_token * (BM * 512) + i] = (uint8_t)sQt(r, c);
         }
     }
     if (tid < BM) {
@@ -459,7 +467,8 @@ void launch_fused_prefill_fp8(
     const void *q, const void *kv, const int *idx, const int *lengths, const float *sink,
     const int *token_positions, const float *cos_sin_cache, uint8_t *out_fp8, float *out_sf,
     float *max_logits, float *lse, float sm_scale_log2, float rms_norm_eps, int topk, int s_kv,
-    int s_q, int n_wv_group, int64_t q_stride, int64_t idx_stride, hggcStream_t stream) {
+    int s_q, int n_wv_group, int64_t q_stride, int64_t idx_stride, uint8_t *dbg_q_dump,
+    hggcStream_t stream) {
     constexpr int NTHR = FusedFp8PrefillTraits<BM, MaxTopk>::Threads;
     constexpr size_t smem = fused_fp8_prefill_smem<BM, MaxTopk, EnableNorm>();
     static_assert(smem <= 256 * 1024);
@@ -468,7 +477,7 @@ void launch_fused_prefill_fp8(
     kernel<<<dim3(s_q, 1), NTHR, smem, stream>>>(
         q, reinterpret_cast<const E4M3 *>(kv), idx, lengths, sink, token_positions, cos_sin_cache,
         out_fp8, out_sf, max_logits, lse, sm_scale_log2, rms_norm_eps, topk, s_kv, n_wv_group,
-        q_stride, idx_stride);
+        q_stride, idx_stride, dbg_q_dump);
     CHECK_CUDA_KERNEL_LAUNCH();
 }
 
