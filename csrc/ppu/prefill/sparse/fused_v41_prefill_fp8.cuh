@@ -230,10 +230,14 @@ fused_norm_rope_attn_rope_cast_prefill_fp8_kernel(
             cute::uint128_t packed;
             auto *pairs = reinterpret_cast<__hg_fp8x2_storage_t *>(&packed);
             CUTLASS_PRAGMA_UNROLL
-            for (int j = 0; j < 8; ++j)
+            for (int j = 0; j < 8; ++j) {
+                // Same scalar pair converter the sparse FP8 prefill kernel
+                // feeds: round the pair to bf16, then let the SDK pack E4M3.
+                alignas(4) cutlass::bfloat16_t bf[2] = {
+                    cutlass::bfloat16_t(x[2 * j]), cutlass::bfloat16_t(x[2 * j + 1])};
                 pairs[j] = flashmla::sparse_native_fp8::pack_e4m3_pair(
-                    __ppu_bfloat162_raw{__ppu_bfloat16_raw(x[2 * j]),
-                                        __ppu_bfloat16_raw(x[2 * j + 1])});
+                    *reinterpret_cast<const __ppu_bfloat162_raw *>(bf));
+            }
             *reinterpret_cast<cute::uint128_t *>(&sQt(r, g * 16)) = packed;
         }
     }
