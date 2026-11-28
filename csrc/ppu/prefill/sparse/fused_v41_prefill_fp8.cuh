@@ -227,18 +227,18 @@ fused_norm_rope_attn_rope_cast_prefill_fp8_kernel(
                     x[j + 1] = rotated.y;
                 }
             }
-            cute::uint128_t packed;
-            auto *pairs = reinterpret_cast<__hg_fp8x2_storage_t *>(&packed);
+            // Scalar E4M3 conversion + 8-code (8-byte) stores, the same
+            // granularity the decode five-in-one's FP8 loader uses, so the Q
+            // path never depends on the pair converter's byte order.
             CUTLASS_PRAGMA_UNROLL
-            for (int j = 0; j < 8; ++j) {
-                // Same scalar pair converter the sparse FP8 prefill kernel
-                // feeds: round the pair to bf16, then let the SDK pack E4M3.
-                alignas(4) cutlass::bfloat16_t bf[2] = {
-                    cutlass::bfloat16_t(x[2 * j]), cutlass::bfloat16_t(x[2 * j + 1])};
-                pairs[j] = flashmla::sparse_native_fp8::pack_e4m3_pair(
-                    *reinterpret_cast<const __ppu_bfloat162_raw *>(bf));
+            for (int h = 0; h < 2; ++h) {
+                alignas(16) cutlass::float_e4m3_t codes[8];
+                CUTLASS_PRAGMA_UNROLL
+                for (int j = 0; j < 8; ++j)
+                    codes[j] = cutlass::float_e4m3_t::from_float(x[h * 8 + j]);
+                *reinterpret_cast<uint2 *>(&sQt(r, g * 16 + h * 8)) =
+                    *reinterpret_cast<const uint2 *>(codes);
             }
-            *reinterpret_cast<cute::uint128_t *>(&sQt(r, g * 16)) = packed;
         }
     }
     if (tid < BM) {
