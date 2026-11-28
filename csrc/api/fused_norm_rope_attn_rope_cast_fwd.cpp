@@ -217,6 +217,17 @@ void launch_fused_decode_splitkv(const Params& raw, const at::Tensor& q) {
                 p.extra_num_blocks, p.extra_page_block_size, extra_bytes,
                 ExtraFP4 ? 4 : 8, p.stride_extra_kv_block)
             && aligned(p.q) && p.stride_q_s_q % 8 == 0 && aligned(p.kv) && aligned(p.extra_kv)) {
+            // This fast path is BF16-only: the H64 packed kernel has no FP8
+            // (e4m3) instantiation, so honouring the flag here would silently
+            // run BF16 while the caller believes it asked for FP8 compute.
+            // The generic split-KV path below does have one, so the fix is to
+            // drop the flag or move the shape off this gate.
+            TORCH_CHECK(!p.fp8_compute,
+                        "fp8_compute is not implemented on the H64 packed decode fast path: "
+                        "the packed kernel is BF16-only, so this shape would silently run BF16 "
+                        "while fp8_compute=true. Set fp8_compute=false, or use a shape that "
+                        "falls through to the generic split-KV path (which has a real e4m3 "
+                        "instantiation).");
             // Packed kernels clamp both length arrays before using them.
             fused::core_attn::run_fused_norm_rope_attn_rope_cast_decode_hs64_packed<EnableNorm, ExtraFP4>(p);
             return;
@@ -247,6 +258,16 @@ void launch_fused_decode_splitkv(const Params& raw, const at::Tensor& q) {
                 row_units ? flashmla::dsa::kHs64V41Fp4RowUnitBytes : 4, p.stride_extra_kv_block))
             && aligned(p.q) && p.stride_q_s_q % 8 == 0 && aligned(p.kv)
             && (pure_swa || aligned(p.extra_kv))) {
+            // Same story as the packed gate above: the direct kernel is
+            // BF16-only, so an fp8_compute request that lands here used to be
+            // answered with a BF16 kernel (bit-identical to the BF16 arm). Fail
+            // loudly instead of lying about which compute path ran.
+            TORCH_CHECK(!p.fp8_compute,
+                        "fp8_compute is not implemented on the H64 direct decode fast path: "
+                        "the direct kernel is BF16-only, so this shape would silently run BF16 "
+                        "while fp8_compute=true. Set fp8_compute=false, or use a shape that "
+                        "falls through to the generic split-KV path (which has a real e4m3 "
+                        "instantiation).");
             // Reuse native H64 attention with complete-query tasks and generic
             // cache addressing and in-kernel length clamps. The packed layout
             // gate above keeps priority.
