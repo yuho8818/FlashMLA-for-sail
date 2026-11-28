@@ -6900,6 +6900,45 @@ __forceinline__ __device__ void hs64_attention(
             }
         }
 
+        // [S63-A1] Cross-query K index prefetch (direct path).
+        //
+        // The direct path has no next-K lookahead: `next_wg0_high_active` above
+        // is prefill-grouped only (topk==2048 && extra_topk<0). Consequently the
+        // next query's prolog K load starts cold at the top of the loop body and
+        // its gather-index latency (`__ldg` on the per-row index array, an L2
+        // round trip) is on the critical path -- measured as the dominant part
+        // of the `memory_dependency` stall (12.5% of warp cycles).
+        //
+        // This hoists ONLY the index prefetch, not the K load: the loaded token
+        // ids are consumed by the next iteration's prolog `prefetch_tok` calls,
+        // which re-issue the same `__ldg`s. Re-issuing is intentional and cheap
+        // (L2-hit, and the compiler cannot cache across the loop-carried barrier
+        // anyway): the point is to have the line resident by then.
+        //
+        // Safety: read-only, no smem/register state carried across the barrier,
+        // no buffer ownership change, and no arithmetic reorder -- the values
+        // loaded are discarded. Correctness is therefore bit-identical by
+        // construction (see evidence/lb1_prereg.md 3.4).
+        if constexpr (kStageOutputInRetiredK && !T::kIsPrefill) {
+            if (next_batch_idx <= end_idx) {
+                // Mirror the prolog's own per-warpgroup block split so both
+                // warpgroups warm exactly the lines they will consume.
+                int next_start_block_idx = 0;
+                int scratch_idx0[T::kGmemPasses];
+                int scratch_idx1[T::kGmemPasses];
+                if (warpgroup_idx == 0) {
+                    prefetch_tok(next_start_block_idx, scratch_idx0, next_batch_idx);
+                    prefetch_tok(next_start_block_idx + 3, scratch_idx1, next_batch_idx);
+                } else {
+                    prefetch_tok(next_start_block_idx + 1, scratch_idx1, next_batch_idx);
+                    prefetch_tok(next_start_block_idx + 2, scratch_idx0, next_batch_idx);
+                }
+                // Consume so the loads are not dead-code eliminated.
+                if (scratch_idx0[0] == -2 && scratch_idx1[0] == -2)
+                    sM[0] = sM[0];
+            }
+        }
+
         float rL_pv[4] = {1.0f, 1.0f, 1.0f, 1.0f};
         bool target_pv_empty[4] = {false, false, false, false};
         bool target_row0_empty = false, target_row1_empty = false;
