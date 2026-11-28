@@ -130,6 +130,7 @@ static FusedHs64Params<PerTokenScale> make_fused_hs64_decode_params(const Output
 }
 
 // Keep generic KV addressing (kPackedMain == 0); only query ownership differs.
+// V523-S65 A1: see the kS65CacheQTiles switch below.
 template<int Arch, bool FloatKV, bool PerTokenScale, bool RowUnits = (Arch == 89)>
 struct FusedHs64DirectTraits : FusedHs64Traits<false,
     flashmla::dsa::hs64::Hs64Traits<512, true, Arch, true, true>, true, false, PerTokenScale> {
@@ -143,6 +144,29 @@ struct FusedHs64DirectTraits : FusedHs64Traits<false,
     // Consecutive owned queries alternate the existing two RoPE slots.
     static constexpr bool kCachePrefillRope = PerTokenScale;
     static constexpr bool kDeferPrefillSink = true;
+    // V523-S65 A1 (occupancy skeleton): the direct path used to keep three Q
+    // A-fragments (tiles 7/6/4) resident in registers across the whole K loop.
+    // Those 3x16 slots are a large part of the 248 regs/thread that pin the
+    // kernel to one CTA per CU. Re-read tiles 7 and 6 from sQ instead:
+    // QKT_GEMM_ONE_TILE then takes qkt_gemm_one_tile_sQ, which issues the
+    // *same* four cute::gemm calls over the same K=16 slices -- identical MMA
+    // sequence, identical numerics -- the only difference is where the
+    // A-operand is staged. The non-cached variant is already the production
+    // path for tiles 0..3 and 5.
+    //
+    // Tile 4 deliberately stays resident: hs64_stage_v41_fp8_even aliases sQ
+    // tile 4 as its scale scratch (and static_asserts on kCacheFirstHighQTile),
+    // so that fragment has no safe shared-memory home.
+    //
+    // Set kS65CacheQTiles back to true to restore the baseline register image.
+    static constexpr bool kS65CacheQTiles = false;
+    static constexpr bool kCacheLastQTile = kS65CacheQTiles && Base::kCacheLastQTile;
+    static constexpr bool kCachePrevQTile = kS65CacheQTiles && Base::kCachePrevQTile;
+    static constexpr bool kCacheFirstHighQTile = Base::kCacheFirstHighQTile;
+    static constexpr int kCachedQTile = kCacheLastQTile ? Base::kCachedQTile : 0;
+    static constexpr int kCachedPrevQTile = kCachePrevQTile ? Base::kCachedPrevQTile : 0;
+    static constexpr int kCachedFirstHighQTile =
+        kCacheFirstHighQTile ? Base::kCachedFirstHighQTile : 0;
     static_assert(Base::kPrefillSinkOffset + 64 * sizeof(float) <= offsetof(SharedMemoryPlan, smem_sP));
 };
 template<int Arch, bool FloatKV, bool PerTokenScale>
