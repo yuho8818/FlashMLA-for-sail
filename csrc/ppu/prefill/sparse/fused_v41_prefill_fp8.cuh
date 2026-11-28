@@ -232,7 +232,8 @@ fused_norm_rope_attn_rope_cast_prefill_fp8_kernel(
             CUTLASS_PRAGMA_UNROLL
             for (int j = 0; j < 8; ++j)
                 pairs[j] = flashmla::sparse_native_fp8::pack_e4m3_pair(
-                    make_float2(x[2 * j], x[2 * j + 1]));
+                    __ppu_bfloat162_raw{__ppu_bfloat16_raw(x[2 * j]),
+                                        __ppu_bfloat16_raw(x[2 * j + 1])});
             *reinterpret_cast<cute::uint128_t *>(&sQt(r, g * 16)) = packed;
         }
     }
