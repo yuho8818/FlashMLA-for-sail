@@ -4,6 +4,9 @@
 #include "ppu/sparse/fused_v41.h"
 #include "ppu/sparse/fused_v41_projection.h"
 
+#include <cstdlib>
+#include <cstring>
+
 void get_mla_metadata_func(Mla_metadata_params &params, hggcStream_t stream);
 void get_mla_uniform_sparse_metadata_func(Mla_metadata_params &params, hggcStream_t stream);
 
@@ -196,13 +199,26 @@ template<int Heads, bool EnableNorm, bool ExtraFP4>
 void launch_fused_decode_splitkv(const Params& raw, const at::Tensor& q) {
     Params p = raw;
     const int sm_count = logical_sm_count();
+    // Debug-only measurement bypass, off by default. When set to a non-empty
+    // value other than "0", both H64 early-exit fast paths (packed and direct)
+    // are skipped for BOTH arms, so an fp8_compute request lands on the generic
+    // split-KV path instead of raising the guard below. That is what makes a
+    // like-for-like generic-BF16 vs generic-FP8 comparison possible on shapes
+    // (e.g. the deployment's (28,6)) that the gates would otherwise capture --
+    // a comparison that could not be measured at all while the gates were
+    // silently swallowing the flag. It changes no kernel and no arithmetic:
+    // only which launcher is selected.
+    const char* disable_fastpath_env = std::getenv("FLASHMLA_DISABLE_HS64_FASTPATH");
+    const bool disable_hs64_fastpath = (disable_fastpath_env != nullptr
+        && disable_fastpath_env[0] != '\0' && std::strcmp(disable_fastpath_env, "0") != 0);
+    (void)disable_hs64_fastpath;  // only the H64 instantiations consult it
     if constexpr (Heads == 64) {
         constexpr int extra_bytes = ExtraFP4 ? 288 : 528;
         const auto aligned = [](const void* ptr) { return reinterpret_cast<uintptr_t>(ptr) % 16 == 0; };
-        const bool packed_arch = (p.arch == 89 && sm_count == 39) ||
+        const bool packed_arch = !disable_hs64_fastpath && ((p.arch == 89 && sm_count == 39) ||
             (p.arch == 80 && sm_count == 20 && !EnableNorm && ExtraFP4 &&
              !p.per_token_scale && p.topk == 128 &&
-             !p.topk_length && !p.extra_topk_length);
+             !p.topk_length && !p.extra_topk_length));
         const bool small_complete_query = p.arch == 89 && !EnableNorm && ExtraFP4
             && p.per_token_scale && p.s_q > 0 && p.s_q < sm_count && p.topk == 128
             && !p.topk_length && !p.extra_topk_length;
@@ -238,10 +254,10 @@ void launch_fused_decode_splitkv(const Params& raw, const at::Tensor& q) {
         const auto pow2 = [](int size) { return size > 0 && (size & (size - 1)) == 0; };
         const bool pure_swa = p.arch == 89 && p.per_token_scale && !p.extra_kv
             && p.extra_topk == 0 && !p.extra_topk_length;
-        const bool direct_arch = (p.arch == 89 && sm_count == 39) ||
+        const bool direct_arch = !disable_hs64_fastpath && ((p.arch == 89 && sm_count == 39) ||
             (p.arch == 80 && ExtraFP4 && !p.per_token_scale
                 && !p.topk_length && !p.extra_topk_length
-                && p.stride_kv_s_kv % 16 == 0 && p.stride_extra_kv_block % 16 == 0);
+                && p.stride_kv_s_kv % 16 == 0 && p.stride_extra_kv_block % 16 == 0));
         const bool legacy_units = flashmla::dsa::sparse_decode_hs64_v41_cache_range_supported(
             p.num_blocks, p.page_block_size, 528, 8, p.stride_kv_s_kv) &&
             (pure_swa || flashmla::dsa::sparse_decode_hs64_v41_cache_range_supported(
