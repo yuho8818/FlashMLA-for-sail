@@ -184,7 +184,7 @@ fused_norm_rope_attn_rope_cast_prefill_fp8_kernel(
             raw[2 * j] = src[0];
             raw[2 * j + 1] = src[1];
             if constexpr (EnableNorm) {
-                const auto *e = reinterpret_cast<const __ppu_bfloat16_raw *>(&raw[2 * j]);
+                const auto *e = reinterpret_cast<const cutlass::bfloat16_t *>(&raw[2 * j]);
                 CUTLASS_PRAGMA_UNROLL
                 for (int i = 0; i < 16; ++i) sumsq = fmaf(float(e[i]), float(e[i]), sumsq);
             }
@@ -207,7 +207,7 @@ fused_norm_rope_attn_rope_cast_prefill_fp8_kernel(
         for (int j = 0; j < 4; ++j) {
             const int g = gbase + j;
             float x[16];
-            const auto *e = reinterpret_cast<const __ppu_bfloat16_raw *>(&raw[2 * j]);
+            const auto *e = reinterpret_cast<const cutlass::bfloat16_t *>(&raw[2 * j]);
             CUTLASS_PRAGMA_UNROLL
             for (int i = 0; i < 16; ++i) x[i] = float(e[i]) * qnorm;
             if (g >= 28) {  // rope dims [448, 512): rotate before quantizing
