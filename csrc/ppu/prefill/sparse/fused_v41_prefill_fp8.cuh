@@ -34,6 +34,9 @@ namespace flashmla::fused_norm_rope_attn_rope_cast_fwd::fp8_prefill {
 using namespace cute;
 using flashmla_fp8_std::ScoreRows;
 
+// The Q/K/V staging arithmetic below assumes 1-byte E4M3 codes.
+static_assert(sizeof(E4M3) == 1, "fused FP8 staging assumes 1-byte E4M3");
+
 static constexpr int FUSED_BN = 64, FUSED_DV = 512;
 static constexpr float NEG_INF = -1e30f;
 static constexpr float P_SCALE = 448.f;
