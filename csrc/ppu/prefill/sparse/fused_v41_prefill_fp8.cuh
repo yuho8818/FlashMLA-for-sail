@@ -65,7 +65,7 @@ template <int BlockM, int MaxTopk> struct FusedFp8PrefillTraits : ScoreRows {
 // Shared-memory bytes: Q tile + 2 KV stages + P + indices + softmax/norm scratch.
 // Float scratch: sPmax/sPsum (4BM each), sRunMax/sRunSum/sScale/sInvDen,
 // sGroupAmax (16 warps x BM/8), sGroupScale (BM/8), sFlag + pad, and for the
-// norm arm sNorm (BM) + sNormPartial (512).
+// norm arm sNorm (BM) + sNormPartial (BM*32 granule partials).
 template <int BM, int MaxTopk, bool EnableNorm>
 constexpr size_t fused_fp8_prefill_smem() {
     constexpr size_t kQ = size_t(BM) * 512;
@@ -73,7 +73,7 @@ constexpr size_t fused_fp8_prefill_smem() {
     constexpr size_t kP = size_t(BM) * FUSED_BN;
     constexpr size_t kIdx = size_t(MaxTopk) * 4;
     constexpr size_t kFloats = 12 * size_t(BM) + 16 * (BM / 8) + (BM / 8) + 4
-        + (EnableNorm ? size_t(BM) + 512 : 0);
+        + (EnableNorm ? size_t(BM) * 33 : 0);
     return kQ + kK + kP + kIdx + kFloats * 4;
 }
 
@@ -169,64 +169,71 @@ fused_norm_rope_attn_rope_cast_prefill_fp8_kernel(
     Tensor dP = thP.retile_D(rP);
 
     // ---- fused Q prologue: load BF16, (norm), RoPE, quantize to E4M3 ----
-    // Each thread owns four consecutive 16-dim granules of one head row, so
-    // the optional RMS reduction is a plain 8-partial smem combine.
+    // Granule loop mirrors the sparse FP8 prefill kernel's Q staging exactly
+    // (i-strided: granule i = (row = i/32, g = i%32), one 16-dim granule per
+    // iteration).  The optional RMS norm runs as a first pass over the same
+    // loop (gmem re-read; one-time per CTA).
     {
         const __ppu_bfloat16_raw *gQ = reinterpret_cast<const __ppu_bfloat16_raw *>(gQRaw)
             + (long)q_token * q_stride;
-        const int row = tid / 8, gbase = (tid % 8) * 4;
-        uint4 raw[8];  // four granules x 32 B (16 bf16 each)
-        float sumsq = 0.f;
-        CUTLASS_PRAGMA_UNROLL
-        for (int j = 0; j < 4; ++j) {
-            const int g = gbase + j;
-            const uint4 *src = reinterpret_cast<const uint4 *>(gQ + (long)row * 512 + g * 16);
-            raw[2 * j] = src[0];
-            raw[2 * j + 1] = src[1];
-            if constexpr (EnableNorm) {
-                const auto *e = reinterpret_cast<const cutlass::bfloat16_t *>(&raw[2 * j]);
-                CUTLASS_PRAGMA_UNROLL
-                for (int i = 0; i < 16; ++i) sumsq = fmaf(float(e[i]), float(e[i]), sumsq);
-            }
-        }
+        const int position = __ldg(gTokenPositions + q_token);
+        const float *rope = gCosSinCache + (long)position * 64;
         if constexpr (EnableNorm) {
-            sNormPartial[tid] = sumsq;
+            for (int i = tid; i < BM * 32; i += NTHR) {
+                const int r = i / 32, g = i % 32;
+                const uint4 *src = reinterpret_cast<const uint4 *>(gQ + (long)r * 512 + g * 16);
+                const uint4 lo = src[0], hi = src[1];
+                const auto *e = reinterpret_cast<const cutlass::bfloat16_t *>(&lo);
+                const auto *e2 = reinterpret_cast<const cutlass::bfloat16_t *>(&hi);
+                float sumsq = 0.f;
+                CUTLASS_PRAGMA_UNROLL
+                for (int j = 0; j < 8; ++j) {
+                    sumsq = fmaf(float(e[j]), float(e[j]), sumsq);
+                    sumsq = fmaf(float(e2[j]), float(e2[j]), sumsq);
+                }
+                sNormPartial[i] = sumsq;  // 32 granule partials per row
+            }
             __syncthreads();
             if (tid < BM) {
                 float s = 0.f;
 #pragma unroll
-                for (int j = 0; j < 8; ++j) s += sNormPartial[tid * 8 + j];
+                for (int j = 0; j < 32; ++j) s += sNormPartial[tid * 32 + j];
                 sNorm[tid] = rsqrtf(s / 512.f + rms_norm_eps);
             }
             __syncthreads();
         }
-        const int position = __ldg(gTokenPositions + q_token);
-        const float *rope = gCosSinCache + (long)position * 64;
-        const float qnorm = EnableNorm ? sNorm[row] : 1.f;
-        CUTLASS_PRAGMA_UNROLL
-        for (int j = 0; j < 4; ++j) {
-            const int g = gbase + j;
+        for (int i = tid; i < BM * 32; i += NTHR) {
+            const int r = i / 32, g = i % 32;
+            const uint4 *src = reinterpret_cast<const uint4 *>(gQ + (long)r * 512 + g * 16);
+            const uint4 lo = src[0], hi = src[1];
+            const auto *e = reinterpret_cast<const cutlass::bfloat16_t *>(&lo);
+            const auto *e2 = reinterpret_cast<const cutlass::bfloat16_t *>(&hi);
             float x[16];
-            const auto *e = reinterpret_cast<const cutlass::bfloat16_t *>(&raw[2 * j]);
             CUTLASS_PRAGMA_UNROLL
-            for (int i = 0; i < 16; ++i) x[i] = float(e[i]) * qnorm;
+            for (int j = 0; j < 8; ++j) {
+                x[2 * j] = float(e[j]);
+                x[2 * j + 1] = float(e2[j]);
+            }
+            const float qnorm = EnableNorm ? sNorm[r] : 1.f;
+            CUTLASS_PRAGMA_UNROLL
+            for (int j = 0; j < 16; ++j) x[j] *= qnorm;
             if (g >= 28) {  // rope dims [448, 512): rotate before quantizing
                 CUTLASS_PRAGMA_UNROLL
-                for (int i = 0; i < 16; i += 2) {
-                    const int pair = (g * 16 + i - 448) / 2;
-                    const float2 rotated = fused_apply_rope(float2{x[i], x[i + 1]},
+                for (int j = 0; j < 16; j += 2) {
+                    const int pair = (g * 16 + j - 448) / 2;
+                    const float2 rotated = fused_apply_rope(float2{x[j], x[j + 1]},
                         __ldg(rope + pair), __ldg(rope + 32 + pair));
-                    x[i] = rotated.x;
-                    x[i + 1] = rotated.y;
+                    x[j] = rotated.x;
+                    x[j + 1] = rotated.y;
                 }
             }
             cute::uint128_t packed;
             auto *pairs = reinterpret_cast<__hg_fp8x2_storage_t *>(&packed);
             CUTLASS_PRAGMA_UNROLL
-            for (int i = 0; i < 8; ++i)
-                pairs[i] = flashmla::sparse_native_fp8::pack_e4m3_pair(
-                    make_float2(x[2 * i], x[2 * i + 1]));
-            *reinterpret_cast<cute::uint128_t *>(&sQt(row, g * 16)) = packed;
+            for (int j = 0; j < 8; ++j)
+                pairs[j] = flashmla::sparse_native_fp8::pack_e4m3_pair(
+                    make_float2(x[2 * j], x[2 * j + 1]));
+            *reinterpret_cast<cute::uint128_t *>(&sQt(r, g * 16)) = packed;
         }
     }
     if (tid < BM) {
